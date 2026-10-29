@@ -1,0 +1,22 @@
+import strings;
+import env;
+import rest;
+import actions;
+import interactions;
+extern fn fr_json_get_path_raw(json: string, path: string): string;
+import discord;
+
+native main {
+    let token: string = env.token("tests/.env");
+    if (str_len(token) == 0) { println("Set DISCORD_TOKEN first."); return 1; }
+    let application: int = rest.request("GET", "/oauth2/applications/@me", token, "", 15000);
+    if (application < 0 || rest.status(application) != 200) { if (application >= 0) { rest.close(application); } println("Application lookup failed."); return 1; }
+    let id: string = discord.json_string(fr_json_get_path_raw(rest.body(application), "id"));
+    rest.close(application);
+    let command: int = actions.register_command(token, id, "", interactions.command("ping", "Reply with Pong!"), 15000);
+    if (command < 0) { println("Command request failed."); return 1; }
+    let status: int = rest.status(command);
+    rest.close(command);
+    if (status < 200 || status >= 300) { println("Command registration failed."); return 1; }
+    println("Global ping command registered."); return 0;
+}

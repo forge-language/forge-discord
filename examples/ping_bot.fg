@@ -1,0 +1,32 @@
+import strings;
+import env;
+import rest;
+import gateway_client;
+import actions;
+import interactions;
+extern fn fr_json_get_path_int(json: string, path: string): int;
+extern fn fr_json_get_path_string(json: string, path: string): string;
+
+native main {
+    let token: string = env.token("tests/.env");
+    if (str_len(token) == 0) { println("Set DISCORD_TOKEN to run the bot."); return 1; }
+    let response: int = rest.request("GET", "/gateway/bot", token, "", 15000);
+    if (response < 0 || rest.status(response) != 200) { if (response >= 0) { rest.close(response); } println("Gateway discovery failed."); return 1; }
+    let url: string = fr_json_get_path_string(rest.body(response), "url");
+    rest.close(response);
+    let client: int = gateway_client.open(str_concat(url, "/?v=10&encoding=json"), token, 0, 0, 1);
+    if (client < 0) { println("Gateway connection failed."); return 1; }
+    println("Bot running. Register a ping command before using it.");
+    while (gateway_client.status(client) == 1 || gateway_client.status(client) == 3) {
+        let event: string = gateway_client.poll(client, 1000);
+        if (str_eq(fr_json_get_path_string(event, "t"), "INTERACTION_CREATE") && fr_json_get_path_int(event, "d.type") == 2 && str_eq(fr_json_get_path_string(event, "d.data.name"), "ping")) {
+            let interaction: string = fr_json_get_path_string(event, "d.id");
+            let interaction_token: string = fr_json_get_path_string(event, "d.token");
+            let reply: int = actions.respond(interaction, interaction_token, interactions.reply("Pong!"), 10000);
+            if (reply < 0) { println("Could not create interaction reply."); }
+            else { if (rest.status(reply) < 200 || rest.status(reply) >= 300) { println("Interaction reply failed."); } rest.close(reply); }
+        }
+        str_reset_arena();
+    }
+    gateway_client.close(client); println("Gateway stopped."); return 1;
+}

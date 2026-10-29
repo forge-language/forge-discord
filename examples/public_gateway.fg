@@ -1,0 +1,26 @@
+import rest;
+import strings;
+extern fn fr_json_get_path_string(json: string, path: string): string;
+extern fn fr_json_get_path_int(json: string, path: string): int;
+extern fn fr_net_ws_open(url: string, headers: string, timeout_ms: int): int;
+extern fn fr_net_ws_recv(handle: int, timeout_ms: int): int;
+extern fn fr_net_ws_kind(handle: int): int;
+extern fn fr_net_ws_close(handle: int): int;
+extern fn fr_buffer_free(handle: int): int;
+
+native main {
+    let response: int = rest.request("GET", "/gateway", "", "", 15000);
+    if (response < 0 || rest.status(response) != 200) { if (response >= 0) { rest.close(response); } println("Gateway discovery failed."); return 1; }
+    let url: string = fr_json_get_path_string(rest.body(response), "url");
+    rest.close(response);
+    if (str_len(url) < 6 || !str_eq(str_sub(url, 0, 6), "wss://")) { println("Invalid gateway URL."); return 1; }
+    let ws: int = fr_net_ws_open(str_concat(url, "/?v=10&encoding=json"), "", 15000);
+    if (ws < 0) { println("Gateway connection failed."); return 1; }
+    let frame: int = fr_net_ws_recv(ws, 15000);
+    if (frame <= 0) { fr_net_ws_close(ws); println("Gateway HELLO timed out or failed."); return 1; }
+    let event: string = rest.text(frame);
+    let valid: int = fr_net_ws_kind(ws) == 1 && fr_json_get_path_int(event, "op") == 10 && fr_json_get_path_int(event, "d.heartbeat_interval") > 0;
+    fr_buffer_free(frame); fr_net_ws_close(ws);
+    if (!valid) { println("Invalid Gateway HELLO."); return 1; }
+    println("Public Gateway HELLO received."); return 0;
+}
