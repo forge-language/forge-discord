@@ -1,0 +1,17 @@
+import rest;
+import strings;
+
+native main {
+    let h: int = rest.create("POST", "http://127.0.0.1:18765/retry", "fixture-token", "{\"content\":\"hi\"}");
+    if (h < 0) { println("request creation failed"); return 1; }
+    if (rest.perform(h, 5000) != 0 || rest.status(h) != 200 || !str_eq(rest.body(h), "{\"ok\":true}")) {
+        rest.close(h); println("HTTP retry test failed"); return 1;
+    }
+    rest.close(h);
+    let upload: int = rest.multipart("POST", "http://127.0.0.1:18765/upload", "fixture-token", "{\"content\":\"hi\"}");
+    if (upload < 0 || rest.add_file(upload, "files[0]", "tests/token.fixture", "text/plain") < 0 || rest.add_file(upload, "files[1]", "tests/token.fixture", "text/plain") < 0 || rest.perform(upload, 5000) != 0 || rest.status(upload) != 200) { if (upload >= 0) { rest.close(upload); } println("multipart test failed"); return 1; }
+    rest.close(upload);
+    let public_request: int = rest.create("GET", "http://127.0.0.1:18765/public", "", "");
+    if (public_request < 0 || rest.perform(public_request, 5000) != 0 || rest.status(public_request) != 200) { if (public_request >= 0) { rest.close(public_request); } println("public request test failed"); return 1; }
+    rest.close(public_request); println("HTTP retry, multipart and public request tests passed"); return 0;
+}

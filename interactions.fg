@@ -1,0 +1,36 @@
+import strings;
+import discord;
+
+fn callback(kind: int, data: string): string {
+    if (kind < 1 || str_len(data) == 0) { return ""; }
+    return str_concat(str_concat(str_concat("{\"type\":", str_from_int(kind)), ",\"data\":"), str_concat(data, "}"));
+}
+
+fn reply(content: string): string { return callback(4, discord.message_json(content)); }
+fn defer(): string { return "{\"type\":5}"; }
+
+fn command(name: string, description: string): string {
+    if (str_len(name) == 0 || str_len(description) == 0) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"name\":"); str_builder_append(b, discord.quote(name));
+    str_builder_append(b, ",\"description\":"); str_builder_append(b, discord.quote(description));
+    str_builder_append(b, "}"); return str_builder_finish(b);
+}
+
+fn button(custom_id: string, label: string, style: int): string {
+    if (str_len(custom_id) == 0 || str_len(custom_id) > 100 || str_len(label) == 0 || str_len(label) > 80 || style < 1 || style > 4) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"type\":2,\"style\":"); str_builder_append(b, str_from_int(style));
+    str_builder_append(b, ",\"custom_id\":"); str_builder_append(b, discord.quote(custom_id));
+    str_builder_append(b, ",\"label\":"); str_builder_append(b, discord.quote(label));
+    str_builder_append(b, "}"); return str_builder_finish(b);
+}
+
+fn modal(custom_id: string, title: string, components_json: string): string {
+    if (str_len(custom_id) == 0 || str_len(custom_id) > 100 || str_len(title) == 0 || str_len(title) > 45 || str_len(components_json) == 0) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"custom_id\":"); str_builder_append(b, discord.quote(custom_id));
+    str_builder_append(b, ",\"title\":"); str_builder_append(b, discord.quote(title));
+    str_builder_append(b, ",\"components\":"); str_builder_append(b, components_json);
+    str_builder_append(b, "}"); return callback(9, str_builder_finish(b));
+}

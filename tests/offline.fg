@@ -1,0 +1,44 @@
+import discord;
+import env;
+import strings;
+import fs;
+import gateway;
+import interactions;
+extern fn fr_os_getenv(name: string): string;
+
+native main {
+    if (!str_eq(discord.api_url("/gateway"), "https://discord.com/api/v10/gateway")) { println("api url failed"); return 1; }
+    if (!str_eq(discord.api_url("gateway"), "")) { println("invalid route failed"); return 1; }
+    if (!str_eq(discord.authorization("abc"), "Authorization: Bot abc")) { println("authorization failed"); return 1; }
+    if (!str_eq(discord.authorization(""), "") || !str_eq(discord.authorization("x\ny"), "")) { println("invalid token failed"); return 1; }
+    if (!str_eq(discord.message_json("hello"), "{\"content\":\"hello\"}")) { println("message failed"); return 1; }
+    if (!str_eq(discord.message_json("\"\\"), "{\"content\":\"\\\"\\\\\"}")) { println("message escaping failed"); return 1; }
+    if (!str_eq(discord.message_json("a\nb"), "{\"content\":\"a\\u000ab\"}")) { println("control escaping failed"); return 1; }
+    if (!str_eq(discord.json_string("\"\\uD83D\\uDE00\\uD55C\\uAE00\""), "😀한글") || !str_eq(discord.json_string("\"\\uD800x\""), "") || !str_eq(discord.json_string("\"\\u0000\""), "")) { println("JSON unicode decoding failed"); return 1; }
+    if (!str_eq(discord.messages_path("123"), "/channels/123/messages") || !str_eq(discord.messages_path("1/2"), "")) { println("route failed"); return 1; }
+    if (!str_eq(discord.child_path(discord.guild_path("123"), "roles", "456"), "/guilds/123/roles/456") || !str_eq(discord.child_path(discord.guild_path("123"), "../x", ""), "")) { println("guild resource route failed"); return 1; }
+    if (!str_eq(discord.guild_special_path("123", "auto-moderation/rules", "456"), "/guilds/123/auto-moderation/rules/456") || !str_eq(discord.guild_special_path("123", "../x", ""), "")) { println("special guild route failed"); return 1; }
+    if (!str_eq(discord.url_encode("a b/😀"), "a%20b%2F%F0%9F%98%80")) { println("URL encoding failed"); return 1; }
+    if (!str_eq(discord.reaction_path("1", "2", "😀", "@me"), "/channels/1/messages/2/reactions/%F0%9F%98%80/@me") || !str_eq(discord.reaction_path("1", "2", "a", "../me"), "")) { println("reaction route failed"); return 1; }
+    if (discord.seconds_ms("1.2341") != 1235 || discord.seconds_ms("0.5") != 500 || discord.seconds_ms("1.") != -1 || discord.seconds_ms("86401") != -1) { println("rate limit duration failed"); return 1; }
+    if (!str_eq(gateway.heartbeat(-1), "{\"op\":1,\"d\":null}") || !str_eq(gateway.heartbeat(42), "{\"op\":1,\"d\":42}")) { println("heartbeat failed"); return 1; }
+    if (!str_eq(gateway.resume("abc", "sid", 9), "{\"op\":6,\"d\":{\"token\":\"abc\",\"session_id\":\"sid\",\"seq\":9}}")) { println("resume failed"); return 1; }
+    if (!str_eq(gateway.voice_state("1", "2", 0, 1), "{\"op\":4,\"d\":{\"guild_id\":\"1\",\"channel_id\":\"2\",\"self_mute\":false,\"self_deaf\":true}}")) { println("voice state failed"); return 1; }
+    if (gateway.close_action(4004) != 2 || gateway.close_action(4007) != 1 || gateway.close_action(1006) != 0 || !gateway.heartbeat_missed(100, 100, 0) || gateway.heartbeat_missed(100, 99, 0) || gateway.heartbeat_missed(100, 100, 1) || gateway.session_resumable("false") || !gateway.session_resumable("true")) { println("gateway transitions failed"); return 1; }
+    if (!str_eq(gateway.identify("x", 0, 1, 1), "")) { println("invalid shard failed"); return 1; }
+    if (!str_eq(interactions.reply("hey"), "{\"type\":4,\"data\":{\"content\":\"hey\"}}")) { println("reply failed"); return 1; }
+    if (!str_eq(interactions.command("ping", "test"), "{\"name\":\"ping\",\"description\":\"test\"}")) { println("command failed"); return 1; }
+    if (!str_eq(interactions.button("yes", "OK", 1), "{\"type\":2,\"style\":1,\"custom_id\":\"yes\",\"label\":\"OK\"}")) { println("button failed"); return 1; }
+    if (!str_eq(interactions.modal("form", "Title", "[]"), "{\"type\":9,\"data\":{\"custom_id\":\"form\",\"title\":\"Title\",\"components\":[]}}")) { println("modal failed"); return 1; }
+    if (!str_eq(env.token_from_file("tests/.env.example"), "")) { println("blank token failed"); return 1; }
+    if (!str_eq(env.token_from_file("tests/token.fixture"), "fixture-token")) { println("token loading failed"); return 1; }
+    if (!str_eq(env.parse_value("'value' # comment"), "value") || !str_eq(env.parse_value("\"value\""), "value") || !str_eq(env.parse_value("value # comment"), "value") || !str_eq(env.parse_value("'bad"), "")) { println("env quoting failed"); return 1; }
+    if (!str_eq(env.token_from_file("tests/nonexistent.env"), "")) { println("missing token file failed"); return 1; }
+    if (!str_eq(env.from_file("tests/env.fixture", "FORGE_DISCORD_ENV_TEST"), "value # retained") || !str_eq(env.from_file("tests/env.fixture", "FORGE_DISCORD_ENV_UNQUOTED"), "plain")) { println("generic env loading failed"); return 1; }
+    if (!str_eq(env.from_file("tests/env.fixture", "DISCORD_TOKEN"), "") || !str_eq(env.from_file("tests/env.fixture", "FORGE_DISCORD_ENV_EMPTY"), "") || !str_eq(env.from_file("tests/env.fixture", ""), "")) { println("env key matching failed"); return 1; }
+    let env_expected: string = fr_os_getenv("FORGE_DISCORD_ENV_TEST");
+    if (str_len(env_expected) == 0) { env_expected = "value # retained"; }
+    if (!str_eq(env.get("tests/env.fixture", "FORGE_DISCORD_ENV_TEST"), env_expected)) { println("env precedence failed"); return 1; }
+    println("offline tests passed");
+    return 0;
+}

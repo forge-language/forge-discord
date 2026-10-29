@@ -1,0 +1,25 @@
+import http;
+import strings;
+import fs;
+
+native main {
+    let server: int = http_listen(18765);
+    if (server < 0) { return 1; }
+    fs_write("build/http-ready", "ready");
+    let i: int = 0;
+    while (i < 4) {
+        let req: int = http_accept(server);
+        if (req < 0) { http_server_close(server); return 1; }
+        if (i < 2 && (!str_eq(http_req_method(req), "POST") || !str_eq(http_req_path(req), "/retry") || !str_eq(http_req_body(req), "{\"content\":\"hi\"}"))) {
+            http_respond(req, 400, "bad request"); http_close(req); http_server_close(server); return 1;
+        }
+        if (i == 2 && (!str_eq(http_req_method(req), "POST") || !str_eq(http_req_path(req), "/upload") || !str_contains(http_req_body(req), "payload_json") || !str_contains(http_req_body(req), "fixture-token") || !str_contains(http_req_body(req), "files[1]"))) {
+            http_respond(req, 400, "bad upload"); http_close(req); http_server_close(server); return 1;
+        }
+        if (i == 3 && (!str_eq(http_req_method(req), "GET") || !str_eq(http_req_path(req), "/public"))) { http_respond(req, 400, "bad public request"); http_close(req); http_server_close(server); return 1; }
+        if (i == 0) { http_respond(req, 429, "{\"retry_after\":0.01}"); }
+        else { http_respond(req, 200, "{\"ok\":true}"); }
+        http_close(req); i = i + 1;
+    }
+    http_server_close(server); return 0;
+}

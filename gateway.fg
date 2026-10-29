@@ -1,0 +1,64 @@
+import strings;
+import discord;
+
+fn identify(token: string, intents: int, shard: int, shards: int): string {
+    if (str_len(discord.authorization(token)) == 0 || intents < 0 || shards < 1 || shard < 0 || shard >= shards) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":2,\"d\":{\"token\":");
+    str_builder_append(b, discord.quote(token));
+    str_builder_append(b, ",\"intents\":"); str_builder_append(b, str_from_int(intents));
+    str_builder_append(b, ",\"properties\":{\"os\":\"linux\",\"browser\":\"forge-discord\",\"device\":\"forge-discord\"},\"shard\":[");
+    str_builder_append(b, str_from_int(shard)); str_builder_append(b, ",");
+    str_builder_append(b, str_from_int(shards)); str_builder_append(b, "]}}");
+    return str_builder_finish(b);
+}
+
+fn heartbeat(sequence: int): string {
+    if (sequence < 0) { return "{\"op\":1,\"d\":null}"; }
+    return str_concat(str_concat("{\"op\":1,\"d\":", str_from_int(sequence)), "}");
+}
+
+fn resume(token: string, session: string, sequence: int): string {
+    if (str_len(discord.authorization(token)) == 0 || str_len(session) == 0 || sequence < 0) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":6,\"d\":{\"token\":"); str_builder_append(b, discord.quote(token));
+    str_builder_append(b, ",\"session_id\":"); str_builder_append(b, discord.quote(session));
+    str_builder_append(b, ",\"seq\":"); str_builder_append(b, str_from_int(sequence));
+    str_builder_append(b, "}}"); return str_builder_finish(b);
+}
+
+fn presence(status: string, activity: string, activity_type: int, afk: int): string {
+    if (!str_eq(status, "online") && !str_eq(status, "idle") && !str_eq(status, "dnd") && !str_eq(status, "invisible")) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":3,\"d\":{\"since\":null,\"activities\":[");
+    if (str_len(activity) > 0) {
+        str_builder_append(b, "{\"name\":"); str_builder_append(b, discord.quote(activity));
+        str_builder_append(b, ",\"type\":"); str_builder_append(b, str_from_int(activity_type)); str_builder_append(b, "}");
+    }
+    str_builder_append(b, "],\"status\":"); str_builder_append(b, discord.quote(status));
+    if (afk != 0) { str_builder_append(b, ",\"afk\":true}}"); } else { str_builder_append(b, ",\"afk\":false}}"); }
+    return str_builder_finish(b);
+}
+
+fn voice_state(guild: string, channel: string, mute: int, deaf: int): string {
+    if (!discord.id_valid(guild) || (str_len(channel) > 0 && !discord.id_valid(channel))) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":4,\"d\":{\"guild_id\":"); str_builder_append(b, discord.quote(guild));
+    str_builder_append(b, ",\"channel_id\":");
+    if (str_len(channel) == 0) { str_builder_append(b, "null"); } else { str_builder_append(b, discord.quote(channel)); }
+    if (mute != 0) { str_builder_append(b, ",\"self_mute\":true"); } else { str_builder_append(b, ",\"self_mute\":false"); }
+    if (deaf != 0) { str_builder_append(b, ",\"self_deaf\":true}}"); } else { str_builder_append(b, ",\"self_deaf\":false}}"); }
+    return str_builder_finish(b);
+}
+
+fn close_action(code: int): int {
+    if (code == 4004 || code == 4010 || code == 4011 || code == 4012 || code == 4013 || code == 4014) { return 2; }
+    if (code == 4007 || code == 4009) { return 1; }
+    return 0;
+}
+
+fn heartbeat_missed(due: int, now: int, acknowledged: int): int {
+    return due > 0 && now >= due && acknowledged == 0;
+}
+
+fn session_resumable(value: string): int { return str_eq(value, "true"); }

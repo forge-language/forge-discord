@@ -1,0 +1,36 @@
+import gateway_client;
+import discord;
+import strings;
+extern fn fr_buffer_new(): int;
+extern fn fr_buffer_append(handle: int, value: int): int;
+extern fn fr_buffer_from_string(value: string): int;
+extern fn fr_monotonic_now_ms(): int;
+
+native main {
+    let state: int = fr_buffer_new();
+    let i: int = 0;
+    while (i < 128) { fr_buffer_append(state, 0); i = i + 1; }
+    if (gateway_client.put(state, 4, 42001) != 0 || gateway_client.get(state, 4) != 42001 || gateway_client.get(state, 16) != -1) { return 1; }
+    gateway_client.put(state, 3, fr_buffer_from_string("session"));
+    gateway_client.put(state, 12, fr_buffer_from_string("wss://example"));
+    gateway_client.reset_session(state);
+    if (gateway_client.get(state, 3) != 0 || gateway_client.get(state, 4) != 0 || gateway_client.get(state, 12) != 0) { return 1; }
+    gateway_client.schedule_reconnect(state);
+    if (gateway_client.status(state) != 3 || gateway_client.get(state, 13) != 2000) { return 1; }
+    let before: int = fr_monotonic_now_ms();
+    gateway_client.poll(state, 0);
+    if (fr_monotonic_now_ms() - before > 500 || gateway_client.status(state) != 3) { return 1; }
+    gateway_client.put(state, 11, 1);
+    gateway_client.put(state, 15, fr_monotonic_now_ms() - 1);
+    gateway_client.poll(state, 0);
+    if (gateway_client.status(state) != 3) { return 1; }
+    i = 0;
+    while (i < 50000) {
+        if (!str_eq(discord.message_json("an event with retained data"), "{\"content\":\"an event with retained data\"}")) { return 1; }
+        str_reset_arena();
+        if (gateway_client.get(state, 13) != 4000) { return 1; }
+        i = i + 1;
+    }
+    gateway_client.close(state);
+    println("Gateway state tests passed"); return 0;
+}

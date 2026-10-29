@@ -1,0 +1,154 @@
+import strings;
+import discord;
+
+extern fn fr_net_http_new(method: string, url: string): int;
+extern fn fr_net_http_header(handle: int, header: string): int;
+extern fn fr_net_http_body(handle: int, buffer: int): int;
+extern fn fr_net_http_file(handle: int, field: string, path: string, content_type: string): int;
+extern fn fr_net_http_field(handle: int, field: string, buffer: int): int;
+extern fn fr_net_http_perform(handle: int, timeout_ms: int): int;
+extern fn fr_net_http_status(handle: int): int;
+extern fn fr_net_http_response(handle: int): int;
+extern fn fr_net_http_headers(handle: int): string;
+extern fn fr_net_error(handle: int): string;
+extern fn fr_net_http_free(handle: int): int;
+extern fn fr_buffer_from_string(value: string): int;
+extern fn fr_buffer_len(handle: int): int;
+extern fn fr_buffer_get(handle: int, index: int): int;
+extern fn fr_buffer_free(handle: int): int;
+extern fn fr_json_get_path_raw(json: string, path: string): string;
+extern fn fr_sleep_ms(milliseconds: int);
+extern fn fr_monotonic_now_ms(): int;
+
+fn text(buffer: int): string {
+    let b: int = str_builder();
+    let i: int = 0;
+    while (i < fr_buffer_len(buffer)) {
+        let c: int = fr_buffer_get(buffer, i);
+        if (c <= 0 || c > 255) { return ""; }
+        str_builder_char(b, c);
+        i = i + 1;
+    }
+    return str_builder_finish(b);
+}
+
+fn create(method: string, url: string, token: string, body: string): int {
+    if (str_len(method) == 0 || str_len(url) == 0 || (str_len(token) > 0 && str_len(discord.authorization(token)) == 0)) { return -1; }
+    let h: int = fr_net_http_new(method, url);
+    if (h < 0) { return -1; }
+    if ((str_len(token) > 0 && fr_net_http_header(h, discord.authorization(token)) < 0) || fr_net_http_header(h, "User-Agent: DiscordBot (https://discord.com/developers/docs, 0.1)") < 0) {
+        fr_net_http_free(h); return -1;
+    }
+    if (str_len(body) > 0) {
+        let data: int = fr_buffer_from_string(body);
+        if (data < 0) { fr_net_http_free(h); return -1; }
+        let result: int = fr_net_http_body(h, data);
+        fr_buffer_free(data);
+        if (result < 0) { fr_net_http_free(h); return -1; }
+    }
+    return h;
+}
+
+fn request(method: string, path: string, token: string, body: string, timeout_ms: int): int {
+    let url: string = discord.api_url(path);
+    if (str_len(url) == 0) { return -1; }
+    let h: int = create(method, url, token, body);
+    if (h < 0) { return -1; }
+    if (str_len(body) > 0 && fr_net_http_header(h, "Content-Type: application/json") < 0) { fr_net_http_free(h); return -1; }
+    perform(h, timeout_ms);
+    return h;
+}
+
+fn upload(method: string, path: string, token: string, payload: string, file: string, content_type: string, timeout_ms: int): int {
+    let url: string = discord.api_url(path);
+    if (str_len(url) == 0 || str_len(file) == 0) { return -1; }
+    let h: int = multipart(method, url, token, payload);
+    if (h < 0) { return -1; }
+    if (fr_net_http_file(h, "files[0]", file, content_type) < 0) { fr_net_http_free(h); return -1; }
+    perform(h, timeout_ms);
+    return h;
+}
+
+fn multipart(method: string, url: string, token: string, payload: string): int {
+    let h: int = create(method, url, token, "");
+    if (h < 0) { return -1; }
+    let data: int = fr_buffer_from_string(payload);
+    if (data < 0) { fr_net_http_free(h); return -1; }
+    let result: int = fr_net_http_field(h, "payload_json", data);
+    fr_buffer_free(data);
+    if (result < 0) { fr_net_http_free(h); return -1; }
+    return h;
+}
+
+fn add_file(handle: int, field: string, path: string, content_type: string): int { return fr_net_http_file(handle, field, path, content_type); }
+fn add_header(handle: int, header: string): int { return fr_net_http_header(handle, header); }
+
+fn status(handle: int): int { return fr_net_http_status(handle); }
+fn headers(handle: int): string { return fr_net_http_headers(handle); }
+fn error(handle: int): string { return fr_net_error(handle); }
+fn close(handle: int): int { return fr_net_http_free(handle); }
+fn body(handle: int): string {
+    let b: int = fr_net_http_response(handle);
+    if (b < 0) { return ""; }
+    let result: string = text(b);
+    fr_buffer_free(b);
+    return result;
+}
+
+fn perform(handle: int, timeout_ms: int): int {
+    if (timeout_ms <= 0) { return -1; }
+    let deadline: int = fr_monotonic_now_ms() + timeout_ms;
+    let retries: int = 0;
+    while (true) {
+        let remaining: int = deadline - fr_monotonic_now_ms();
+        if (remaining <= 0) { return -1; }
+        let result: int = fr_net_http_perform(handle, remaining);
+        if (result < 0 || fr_net_http_status(handle) != 429 || retries >= 3) { return result; }
+        let delay: int = discord.seconds_ms(fr_json_get_path_raw(body(handle), "retry_after"));
+        if (delay < 0 || delay >= deadline - fr_monotonic_now_ms()) { return 0; }
+        let retry_at: int = fr_monotonic_now_ms() + delay;
+        while (fr_monotonic_now_ms() < retry_at) { fr_sleep_ms(retry_at - fr_monotonic_now_ms()); }
+        retries = retries + 1;
+    }
+    return 0;
+}
+
+fn send_message(token: string, channel: string, content: string, timeout_ms: int): int {
+    return request("POST", discord.messages_path(channel), token, discord.message_json(content), timeout_ms);
+}
+
+fn channel(method: string, token: string, channel_id: string, body: string, timeout_ms: int): int {
+    return request(method, discord.channel_path(channel_id), token, body, timeout_ms);
+}
+
+fn guild(method: string, token: string, guild_id: string, body: string, timeout_ms: int): int {
+    return request(method, discord.guild_path(guild_id), token, body, timeout_ms);
+}
+
+fn guild_resource(method: string, token: string, guild_id: string, collection: string, id: string, body: string, timeout_ms: int): int {
+    return request(method, discord.child_path(discord.guild_path(guild_id), collection, id), token, body, timeout_ms);
+}
+
+fn message(method: string, token: string, channel_id: string, message_id: string, body: string, timeout_ms: int): int {
+    let path: string = discord.messages_path(channel_id);
+    if (str_len(path) == 0 || !discord.id_valid(message_id)) { return -1; }
+    return request(method, str_concat(str_concat(path, "/"), message_id), token, body, timeout_ms);
+}
+
+fn reaction(method: string, token: string, channel_id: string, message_id: string, emoji: string, user_id: string, timeout_ms: int): int {
+    return request(method, discord.reaction_path(channel_id, message_id, emoji, user_id), token, "", timeout_ms);
+}
+
+fn channel_resource(method: string, token: string, channel_id: string, collection: string, id: string, body: string, timeout_ms: int): int {
+    return request(method, discord.child_path(discord.channel_path(channel_id), collection, id), token, body, timeout_ms);
+}
+
+fn guild_special(method: string, token: string, guild_id: string, resource: string, id: string, body: string, timeout_ms: int): int {
+    return request(method, discord.guild_special_path(guild_id, resource, id), token, body, timeout_ms);
+}
+
+fn poll_expire(token: string, channel_id: string, message_id: string, timeout_ms: int): int {
+    let channel: string = discord.channel_path(channel_id);
+    if (str_len(channel) == 0 || !discord.id_valid(message_id)) { return -1; }
+    return request("POST", str_concat(str_concat(str_concat(channel, "/polls/"), message_id), "/expire"), token, "", timeout_ms);
+}

@@ -1,0 +1,54 @@
+import env;
+import discord;
+import strings;
+import rest;
+import gateway_client;
+import gateway;
+extern fn fr_json_get_path_string(json: string, path: string): string;
+extern fn fr_monotonic_now_ms(): int;
+
+native main {
+    let token: string = env.token("tests/.env");
+    if (str_eq(discord.authorization(token), "")) {
+        println("Set DISCORD_TOKEN in tests/.env to run the live test.");
+        return 1;
+    }
+    let response: int = rest.request("GET", "/users/@me", token, "", 15000);
+    if (response < 0) { println("Could not create request."); return 1; }
+    let code: int = rest.status(response);
+    rest.close(response);
+    if (code != 200) { println("Discord request failed; HTTP status:"); println(code); return 1; }
+    println("Discord authenticated REST test passed.");
+    let gateway_response: int = rest.request("GET", "/gateway/bot", token, "", 15000);
+    if (gateway_response < 0 || rest.status(gateway_response) != 200) { if (gateway_response >= 0) { rest.close(gateway_response); } println("Gateway discovery failed."); return 1; }
+    let gateway_url: string = fr_json_get_path_string(rest.body(gateway_response), "url");
+    rest.close(gateway_response);
+    let client: int = gateway_client.open(str_concat(gateway_url, "/?v=10&encoding=json"), token, 0, 0, 1);
+    if (client < 0) { println("Gateway connection failed."); return 1; }
+    let deadline: int = fr_monotonic_now_ms() + 30000;
+    let ready: int = 0;
+    while (fr_monotonic_now_ms() < deadline && gateway_client.status(client) == 1 && ready == 0) {
+        let event: string = gateway_client.poll(client, 1000);
+        if (str_eq(fr_json_get_path_string(event, "t"), "READY")) { ready = 1; }
+    }
+    if (ready == 0) { gateway_client.close(client); println("Gateway READY was not received."); return 1; }
+    println("Discord Gateway READY test passed.");
+    if (gateway_client.reconnect(client) < 0) { gateway_client.close(client); println("Gateway reconnect failed."); return 1; }
+    deadline = fr_monotonic_now_ms() + 30000;
+    let resumed: int = 0;
+    while (fr_monotonic_now_ms() < deadline && gateway_client.status(client) == 1 && resumed == 0) {
+        let event: string = gateway_client.poll(client, 1000);
+        if (str_eq(fr_json_get_path_string(event, "t"), "RESUMED")) { resumed = 1; }
+    }
+    if (resumed == 0) { gateway_client.close(client); println("Gateway RESUMED was not received."); return 1; }
+    println("Discord Gateway resume test passed.");
+    if (gateway_client.send_payload(client, gateway.heartbeat(gateway_client.get(client, 4) - 1)) < 0) { gateway_client.close(client); println("Gateway heartbeat send failed."); return 1; }
+    gateway_client.put(client, 7, 0);
+    deadline = fr_monotonic_now_ms() + 15000;
+    while (fr_monotonic_now_ms() < deadline && gateway_client.status(client) == 1 && gateway_client.get(client, 7) == 0) { gateway_client.poll(client, 1000); }
+    let acknowledged: int = gateway_client.get(client, 7);
+    gateway_client.close(client);
+    if (acknowledged != 1) { println("Gateway heartbeat ACK was not received."); return 1; }
+    println("Discord Gateway heartbeat ACK test passed.");
+    return 0;
+}

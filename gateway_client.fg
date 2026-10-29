@@ -1,0 +1,212 @@
+import strings;
+import gateway;
+import rest;
+
+extern fn fr_buffer_new(): int;
+extern fn fr_buffer_from_string(value: string): int;
+extern fn fr_buffer_append(handle: int, value: int): int;
+extern fn fr_buffer_set(handle: int, index: int, value: int): int;
+extern fn fr_buffer_get(handle: int, index: int): int;
+extern fn fr_buffer_free(handle: int): int;
+extern fn fr_net_ws_open(url: string, headers: string, timeout_ms: int): int;
+extern fn fr_net_ws_send(handle: int, buffer: int, binary: int, timeout_ms: int): int;
+extern fn fr_net_ws_recv(handle: int, timeout_ms: int): int;
+extern fn fr_net_ws_kind(handle: int): int;
+extern fn fr_net_ws_close(handle: int): int;
+extern fn fr_json_get_path_raw(json: string, path: string): string;
+extern fn fr_json_get_path_string(json: string, path: string): string;
+extern fn fr_json_get_path_int(json: string, path: string): int;
+extern fn fr_monotonic_now_ms(): int;
+extern fn fr_random_bounded(bound: int): int;
+extern fn fr_sleep_ms(milliseconds: int);
+
+fn put(state: int, slot: int, value: int): int {
+    if (value < 0 || slot < 0 || slot > 15) { return -1; }
+    let i: int = 0;
+    while (i < 8) {
+        if (fr_buffer_set(state, slot * 8 + i, value % 256) < 0) { return -1; }
+        value = value / 256; i = i + 1;
+    }
+    return 0;
+}
+
+fn get(state: int, slot: int): int {
+    if (slot < 0 || slot > 15) { return -1; }
+    let value: int = 0;
+    let i: int = 7;
+    while (i >= 0) {
+        let c: int = fr_buffer_get(state, slot * 8 + i);
+        if (c < 0) { return -1; }
+        if (i == 7 && c > 127) { return -1; }
+        value = value * 256 + c; i = i - 1;
+    }
+    return value;
+}
+
+fn open(url: string, token: string, intents: int, shard: int, shards: int): int {
+    if (str_len(url) < 6 || !str_eq(str_sub(url, 0, 6), "wss://") || str_len(gateway.identify(token, intents, shard, shards)) == 0) { return -1; }
+    let state: int = fr_buffer_new();
+    if (state < 0) { return -1; }
+    let i: int = 0;
+    while (i < 128) { if (fr_buffer_append(state, 0) < 0) { fr_buffer_free(state); return -1; } i = i + 1; }
+    let token_buf: int = fr_buffer_from_string(token);
+    let url_buf: int = fr_buffer_from_string(url);
+    if (token_buf < 0 || url_buf < 0) {
+        if (token_buf > 0) { fr_buffer_free(token_buf); } if (url_buf > 0) { fr_buffer_free(url_buf); }
+        fr_buffer_free(state); return -1;
+    }
+    put(state, 1, token_buf); put(state, 2, url_buf);
+    put(state, 8, intents); put(state, 9, shard); put(state, 10, shards); put(state, 11, 1);
+    if (reconnect(state) < 0) { close(state); return -1; }
+    return state;
+}
+
+fn reconnect(state: int): int { return reconnect_for(state, 15000); }
+
+fn reconnect_for(state: int, timeout_ms: int): int {
+    let old: int = get(state, 0);
+    if (old > 0) { fr_net_ws_close(old); put(state, 0, 0); }
+    let url_buf: int = get(state, 12);
+    if (url_buf == 0) { url_buf = get(state, 2); }
+    let ws: int = fr_net_ws_open(rest.text(url_buf), "", timeout_ms);
+    if (ws < 0) { schedule_reconnect(state); return -1; }
+    put(state, 0, ws); put(state, 5, 0); put(state, 6, 0); put(state, 7, 1); put(state, 11, 1); put(state, 14, 0); put(state, 15, fr_monotonic_now_ms() + 10000);
+    return 0;
+}
+
+fn send_payload(state: int, payload: string): int {
+    return send_for(state, payload, 10000);
+}
+
+fn send_for(state: int, payload: string, timeout_ms: int): int {
+    let b: int = fr_buffer_from_string(payload);
+    if (b < 0) { return -1; }
+    let result: int = fr_net_ws_send(get(state, 0), b, 0, timeout_ms);
+    fr_buffer_free(b); return result;
+}
+
+fn close(state: int): int {
+    let ws: int = get(state, 0);
+    if (ws > 0) { fr_net_ws_close(ws); }
+    let slot: int = 1;
+    while (slot <= 3) { let b: int = get(state, slot); if (b > 0) { fr_buffer_free(b); } slot = slot + 1; }
+    let resume_url: int = get(state, 12);
+    if (resume_url > 0) { fr_buffer_free(resume_url); }
+    return fr_buffer_free(state);
+}
+
+fn status(state: int): int { return get(state, 11); }
+
+fn schedule_reconnect(state: int) {
+    let ws: int = get(state, 0);
+    if (ws > 0) { fr_net_ws_close(ws); put(state, 0, 0); }
+    let delay: int = get(state, 13);
+    if (delay < 1000) { delay = 1000; }
+    let jitter: int = fr_random_bounded(delay);
+    if (jitter < 0) { put(state, 11, 2); return; }
+    put(state, 6, fr_monotonic_now_ms() + delay + jitter);
+    if (delay < 30000) { delay = delay * 2; if (delay > 30000) { delay = 30000; } }
+    put(state, 13, delay); put(state, 11, 3);
+}
+
+fn poll(state: int, timeout_ms: int): string {
+    if (timeout_ms < 0 || timeout_ms > 86400000) { return ""; }
+    let deadline: int = fr_monotonic_now_ms() + timeout_ms;
+    if (status(state) == 3) {
+        let wait: int = get(state, 6) - fr_monotonic_now_ms();
+        if (wait > 0) { if (wait > timeout_ms) { wait = timeout_ms; } fr_sleep_ms(wait); }
+        let remaining: int = deadline - fr_monotonic_now_ms();
+        if (remaining > 0 && fr_monotonic_now_ms() >= get(state, 6)) { reconnect_for(state, remaining); }
+        return "";
+    }
+    if (status(state) != 1) { return ""; }
+    let pending: int = get(state, 14);
+    if (pending > 0) {
+        let remaining: int = deadline - fr_monotonic_now_ms();
+        if (remaining <= 0) { return ""; }
+        let payload: string = "";
+        if (pending == 1) {
+            let token: string = rest.text(get(state, 1));
+            let session: int = get(state, 3);
+            payload = gateway.identify(token, get(state, 8), get(state, 9), get(state, 10));
+            if (session > 0 && get(state, 4) > 0) { payload = gateway.resume(token, rest.text(session), get(state, 4) - 1); }
+        } else { payload = gateway.heartbeat(get(state, 4) - 1); }
+        if (send_for(state, payload, remaining) < 0) { schedule_reconnect(state); return ""; }
+        put(state, 14, 0);
+        if (pending == 2) { put(state, 7, 0); put(state, 6, fr_monotonic_now_ms() + get(state, 5)); }
+        return "";
+    }
+    let now: int = fr_monotonic_now_ms();
+    let hello_due: int = get(state, 15);
+    if (hello_due > 0 && now >= hello_due) { schedule_reconnect(state); return ""; }
+    let due: int = get(state, 6);
+    if (due > 0 && now >= due) {
+        if (gateway.heartbeat_missed(due, now, get(state, 7))) { schedule_reconnect(state); return ""; }
+        put(state, 14, 2); return "";
+    }
+    due = get(state, 6);
+    if (due > 0 && due - now < timeout_ms) { timeout_ms = due - now; }
+    if (hello_due > 0 && hello_due - now < timeout_ms) { timeout_ms = hello_due - now; }
+    if (deadline - fr_monotonic_now_ms() < timeout_ms) { timeout_ms = deadline - fr_monotonic_now_ms(); }
+    if (timeout_ms < 0) { timeout_ms = 0; }
+    let ws: int = get(state, 0);
+    let frame: int = fr_net_ws_recv(ws, timeout_ms);
+    if (frame == 0) { return ""; }
+    if (frame < 0) { schedule_reconnect(state); return ""; }
+    let kind: int = fr_net_ws_kind(ws);
+    if (kind == 8) {
+        let code: int = 0;
+        if (fr_buffer_get(frame, 0) >= 0 && fr_buffer_get(frame, 1) >= 0) { code = fr_buffer_get(frame, 0) * 256 + fr_buffer_get(frame, 1); }
+        fr_buffer_free(frame);
+        let action: int = gateway.close_action(code);
+        if (action == 2) { put(state, 11, 2); return ""; }
+        if (action == 1) { reset_session(state); }
+        schedule_reconnect(state); return "";
+    }
+    if (kind != 1) { fr_buffer_free(frame); put(state, 11, 2); return ""; }
+    let event: string = rest.text(frame);
+    fr_buffer_free(frame);
+    if (str_len(event) == 0 || str_len(fr_json_get_path_raw(event, "op")) == 0) { put(state, 11, 2); return ""; }
+    let op: int = fr_json_get_path_int(event, "op");
+    if (op == 10) {
+        put(state, 15, 0);
+        let interval: int = fr_json_get_path_int(event, "d.heartbeat_interval");
+        if (interval <= 0) { put(state, 11, 2); return ""; }
+        let jitter: int = fr_random_bounded(interval);
+        if (jitter < 0) { put(state, 11, 2); return ""; }
+        put(state, 5, interval); put(state, 6, fr_monotonic_now_ms() + jitter); put(state, 7, 1);
+        put(state, 14, 1);
+        return "";
+    }
+    if (op == 11) { put(state, 7, 1); return ""; }
+    if (op == 1) {
+        put(state, 14, 2);
+        return "";
+    }
+    if (op == 7) { schedule_reconnect(state); return ""; }
+    if (op == 9) {
+        if (!gateway.session_resumable(fr_json_get_path_raw(event, "d"))) { reset_session(state); }
+        schedule_reconnect(state); return "";
+    }
+    if (op != 0) { return ""; }
+    if (str_eq(fr_json_get_path_string(event, "t"), "RESUMED")) { put(state, 13, 0); }
+    let seq: int = fr_json_get_path_int(event, "s");
+    if (seq >= 0 && str_len(fr_json_get_path_raw(event, "s")) > 0) { put(state, 4, seq + 1); }
+    if (str_eq(fr_json_get_path_string(event, "t"), "READY")) {
+        put(state, 13, 0);
+        reset_handles(state);
+        let session: int = fr_buffer_from_string(fr_json_get_path_string(event, "d.session_id"));
+        let base: string = fr_json_get_path_string(event, "d.resume_gateway_url");
+        if (session < 0 || str_len(base) < 6 || !str_eq(str_sub(base, 0, 6), "wss://")) { if (session > 0) { fr_buffer_free(session); } put(state, 11, 2); return ""; }
+        let resume_url: int = fr_buffer_from_string(str_concat(base, "/?v=10&encoding=json"));
+        if (resume_url < 0) { fr_buffer_free(session); put(state, 11, 2); return ""; }
+        put(state, 3, session); put(state, 12, resume_url);
+    }
+    return event;
+}
+
+fn reset_handles(state: int) {
+    let session: int = get(state, 3); if (session > 0) { fr_buffer_free(session); put(state, 3, 0); }
+    let url: int = get(state, 12); if (url > 0) { fr_buffer_free(url); put(state, 12, 0); }
+}
+fn reset_session(state: int) { reset_handles(state); put(state, 4, 0); }

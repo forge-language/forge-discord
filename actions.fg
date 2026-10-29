@@ -1,0 +1,29 @@
+import strings;
+import discord;
+import rest;
+
+fn register_command(bot_token: string, application: string, guild: string, command_json: string, timeout_ms: int): int {
+    if (!discord.id_valid(application)) { return -1; }
+    let path: string = str_concat("/applications/", application);
+    if (str_len(guild) > 0) {
+        if (!discord.id_valid(guild)) { return -1; }
+        path = str_concat(str_concat(path, "/guilds/"), guild);
+    }
+    return rest.request("POST", str_concat(path, "/commands"), bot_token, command_json, timeout_ms);
+}
+
+fn respond(interaction: string, interaction_token: string, response_json: string, timeout_ms: int): int {
+    if (!discord.id_valid(interaction) || str_len(interaction_token) == 0) { return -1; }
+    let path: string = str_concat(str_concat(str_concat("/interactions/", interaction), "/"), discord.url_encode(interaction_token));
+    return rest.request("POST", str_concat(path, "/callback"), "", response_json, timeout_ms);
+}
+
+fn followup(method: string, application: string, interaction_token: string, message_id: string, body: string, timeout_ms: int): int {
+    if (!discord.id_valid(application) || str_len(interaction_token) == 0) { return -1; }
+    let path: string = str_concat(str_concat(str_concat("/webhooks/", application), "/"), discord.url_encode(interaction_token));
+    if (str_len(message_id) > 0) {
+        if (!discord.id_valid(message_id) && !str_eq(message_id, "@original")) { return -1; }
+        path = str_concat(str_concat(path, "/messages/"), message_id);
+    }
+    return rest.request(method, path, "", body, timeout_ms);
+}
