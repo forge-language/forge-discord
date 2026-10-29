@@ -1,0 +1,166 @@
+import voice;
+import net;
+import strings;
+import dave;
+import audio_crypto;
+import audio_process;
+import gateway_client;
+import os;
+import fs;
+
+native main {
+    if (!str_eq(voice.state_update("123", "456"), "{\"op\":4,\"d\":{\"guild_id\":\"123\",\"channel_id\":\"456\",\"self_mute\":false,\"self_deaf\":false}}")) { return 1; }
+    if (!str_eq(voice.state_update("123", ""), "{\"op\":4,\"d\":{\"guild_id\":\"123\",\"channel_id\":null,\"self_mute\":false,\"self_deaf\":false}}")) { return 1; }
+    if (!str_eq(voice.identify("1", "2", "session", "tok\"en", 1), "{\"op\":0,\"d\":{\"server_id\":\"1\",\"user_id\":\"2\",\"session_id\":\"session\",\"token\":\"tok\\\"en\",\"max_dave_protocol_version\":1}}")) { return 1; }
+    if (!str_eq(voice.heartbeat(100, 7), "{\"op\":3,\"d\":{\"t\":100,\"seq_ack\":7}}")) { return 1; }
+    let p: int = voice.discovery_request(16909060);
+    if (buffer_len(p) != 74 || buffer_get(p, 1) != 1 || buffer_get(p, 3) != 70 || buffer_get(p, 4) != 1 || buffer_get(p, 7) != 4) { return 1; }
+    buffer_set(p, 1, 2); buffer_set(p, 8, 49); buffer_set(p, 9, 50); buffer_set(p, 10, 55); buffer_set(p, 11, 46);
+    buffer_set(p, 12, 48); buffer_set(p, 13, 46); buffer_set(p, 14, 48); buffer_set(p, 15, 46); buffer_set(p, 16, 49);
+    buffer_set(p, 72, 18); buffer_set(p, 73, 52);
+    if (!str_eq(voice.discovery_address(p, 16909060), "127.0.0.1") || voice.discovery_port(p, 16909060) != 4660 || voice.discovery_port(p, 1) != -1) { return 1; }
+    if (!str_eq(voice.select_protocol("127.0.0.1", 4660), "{\"op\":1,\"d\":{\"protocol\":\"udp\",\"data\":{\"address\":\"127.0.0.1\",\"port\":4660,\"mode\":\"aead_xchacha20_poly1305_rtpsize\"}}}")) { return 1; }
+    buffer_free(p);
+    let key: int = buffer_new(); let i: int = 0;
+    while (i < 32) { buffer_append(key, i); i = i + 1; }
+    let frame: int = buffer_new(); buffer_append(frame, 0); buffer_append(frame, 255);
+    let packet: int = voice.transport_packet(key, frame, 42, 960, 12345, 1);
+    if (packet < 0 || buffer_len(packet) != 34 || buffer_get(packet, 0) != 128 || buffer_get(packet, 1) != 120 || buffer_get(packet, 3) != 42 || buffer_get(packet, 33) != 1) { return 1; }
+    let plain: int = voice.transport_decrypt(key, packet);
+    if (plain < 0 || buffer_len(plain) != 2 || buffer_get(plain, 0) != 0 || buffer_get(plain, 1) != 255) { return 1; }
+    buffer_set(packet, 3, 43);
+    if (voice.transport_decrypt(key, packet) != -1) { return 1; }
+    buffer_free(plain); buffer_free(packet);
+    let header: int = buffer_new(); buffer_append(header, 176); buffer_append(header, 120);
+    i = 0; while (i < 10) { buffer_append(header, 0); i = i + 1; }
+    buffer_append(header, 190); buffer_append(header, 222); buffer_append(header, 0); buffer_append(header, 1);
+    let nonce: int = buffer_new(); i = 0; while (i < 24) { buffer_append(nonce, 0); i = i + 1; }
+    let extended: int = buffer_new(); buffer_append(extended, 1); buffer_append(extended, 2); buffer_append(extended, 3); buffer_append(extended, 4);
+    buffer_append(extended, 9); buffer_append(extended, 10); buffer_append(extended, 0); buffer_append(extended, 2);
+    let encrypted: int = xchacha_encrypt(key, nonce, header, extended);
+    packet = buffer_new(); buffer_append_buffer(packet, header); buffer_append_buffer(packet, encrypted); i = 0; while (i < 4) { buffer_append(packet, 0); i = i + 1; }
+    plain = voice.transport_decrypt(key, packet);
+    if (plain < 0 || buffer_len(plain) != 2 || buffer_get(plain, 0) != 9 || buffer_get(plain, 1) != 10) { return 1; }
+    buffer_free(plain); buffer_free(packet); buffer_free(encrypted);
+    buffer_set(header, 15, 3); encrypted = xchacha_encrypt(key, nonce, header, extended);
+    packet = buffer_new(); buffer_append_buffer(packet, header); buffer_append_buffer(packet, encrypted); i = 0; while (i < 4) { buffer_append(packet, 0); i = i + 1; }
+    if (voice.transport_decrypt(key, packet) != -1) { return 1; }
+    buffer_free(packet); buffer_free(encrypted); buffer_free(header); buffer_free(nonce); buffer_free(extended); buffer_free(frame); buffer_free(key);
+    let session: int = dave_new(1, "123", "456");
+    if (session < 0) { return 1; }
+    let key_message: int = voice.dave_key_message(session);
+    if (key_message < 0 || buffer_len(key_message) < 2 || buffer_get(key_message, 0) != 26) { return 1; }
+    let malformed: int = buffer_new(); buffer_append(malformed, 0); buffer_append(malformed, 9); buffer_append(malformed, 29);
+    if (voice.dave_sequence(malformed) != 9 || voice.dave_transition(malformed) != -1 || voice.dave_binary(session, malformed) != -1) { return 1; }
+    buffer_free(malformed); buffer_free(key_message);
+    let sender: int = buffer_from_base64("QEEEmVGKgkknTNnWhZgwNTSzi2AtLEqAiHHRJxUYpOeT9IUuNTqhx4yQ52ml5XX1nDanRU+JsKpgWdSO7ecWxdMGhQABBAABAQA=");
+    if (sender < 0 || dave_external_sender(session, sender) < 0) { println("external sender failed"); return 1; }
+    let enc: int = dave_encryptor_new(session, "456", 123); let dec: int = dave_decryptor_new(session, "456");
+    if (enc != -1 || dec != -1) { println("pending MLS group exposed a ratchet"); return 1; }
+    buffer_free(sender); dave_free(session);
+    let queue: int = voice.queue_new();
+    if (queue < 0 || voice.queue_add(queue, "/dev/null") != 0 || voice.queue_pause(queue) != 0 || voice.queue_next(queue) != 0 || voice.queue_resume(queue) != 0) { return 1; }
+    if (voice.queue_next(queue) <= 0) { return 1; }
+    let deadline: int = monotonic_now_ms() + 5000; let outcome: int = 0;
+    while (outcome == 0 && monotonic_now_ms() < deadline) { outcome = voice.queue_read(queue, 4096, 100); }
+    if (outcome != -3 || voice.queue_next(queue) != 0 || voice.queue_free(queue) != 0) { return 1; }
+    let path: string = os_temp_file(); let command: int = os_command("ffmpeg");
+    if (str_len(path) == 0 || command <= 0) { return 1; }
+    os_command_arg(command, "-nostdin"); os_command_arg(command, "-v"); os_command_arg(command, "error"); os_command_arg(command, "-y");
+    os_command_arg(command, "-f"); os_command_arg(command, "lavfi"); os_command_arg(command, "-i"); os_command_arg(command, "sine=frequency=440:duration=0.04");
+    os_command_arg(command, "-f"); os_command_arg(command, "wav"); os_command_arg(command, path);
+    if (os_command_run(command) != 0) { os_command_free(command); fs_remove(path); return 1; } os_command_free(command);
+    queue = voice.queue_new(); if (voice.queue_add(queue, path) != 0 || voice.queue_next(queue) <= 0) { fs_remove(path); return 1; }
+    let total: int = 0; outcome = 0; deadline = monotonic_now_ms() + 5000;
+    while (outcome == 0 && monotonic_now_ms() < deadline) {
+        let chunk: int = voice.queue_read(queue, 4096, 100);
+        if (chunk > 0) { total = total + buffer_len(chunk); buffer_free(chunk); } else if (chunk < 0) { outcome = chunk; }
+    }
+    voice.queue_free(queue);
+    if (outcome != -2 || total != 7680) { println("ffmpeg decoding failed", outcome, total); return 1; }
+    let slash: int = 0; i = 0;
+    while (i < str_len(path)) { if (str_char_at(path, i) == 47) { slash = i; } i = i + 1; }
+    let directory: string = str_sub(path, 0, slash); let basename: string = str_sub(path, slash + 1, str_len(path) - slash - 1);
+    let server: int = stream_process_new("python3");
+    if (server < 0 || stream_process_arg(server, "-u") < 0 || stream_process_arg(server, "-m") < 0 || stream_process_arg(server, "http.server") < 0 || stream_process_arg(server, "0") < 0 || stream_process_arg(server, "--bind") < 0 || stream_process_arg(server, "127.0.0.1") < 0 || stream_process_arg(server, "--directory") < 0 || stream_process_arg(server, directory) < 0 || stream_process_start(server) < 0) { fs_remove(path); return 1; }
+    let banner: int = buffer_new(); deadline = monotonic_now_ms() + 5000;
+    while (!str_contains(buffer_string(banner), "\n") && monotonic_now_ms() < deadline) {
+        let chunk: int = stream_process_read(server, 256, 100);
+        if (chunk > 0) { buffer_append_buffer(banner, chunk); buffer_free(chunk); } else if (chunk < 0) { stream_process_free(server); buffer_free(banner); fs_remove(path); return 1; }
+    }
+    let http_port: int = 0; i = 0;
+    while (i + 5 < buffer_len(banner)) {
+        if (buffer_get(banner, i) == 112 && buffer_get(banner, i + 1) == 111 && buffer_get(banner, i + 2) == 114 && buffer_get(banner, i + 3) == 116 && buffer_get(banner, i + 4) == 32) {
+            i = i + 5;
+            while (i < buffer_len(banner) && buffer_get(banner, i) >= 48 && buffer_get(banner, i) <= 57) { http_port = http_port * 10 + buffer_get(banner, i) - 48; i = i + 1; }
+            i = buffer_len(banner);
+        } else { i = i + 1; }
+    }
+    buffer_free(banner);
+    if (http_port < 1 || http_port > 65535) { stream_process_free(server); fs_remove(path); println("local music HTTP server failed"); return 1; }
+    let url: string = str_concat(str_concat(str_concat("http://127.0.0.1:", str_from_int(http_port)), "/"), basename);
+    let request: int = net_http_new("GET", url); deadline = monotonic_now_ms() + 5000; let ready: int = 0;
+    while (ready == 0 && monotonic_now_ms() < deadline) { if (net_http_perform(request, 200) == 0 && net_http_status(request) == 200) { ready = 1; } }
+    net_http_free(request);
+    if (ready == 0) { stream_process_free(server); fs_remove(path); println("local music HTTP server failed"); return 1; }
+    queue = voice.queue_new(); if (voice.queue_add(queue, url) != 0 || voice.queue_next(queue) <= 0) { stream_process_free(server); fs_remove(path); return 1; }
+    total = 0; outcome = 0; deadline = monotonic_now_ms() + 5000;
+    while (outcome == 0 && monotonic_now_ms() < deadline) {
+        let chunk: int = voice.queue_read(queue, 4096, 100);
+        if (chunk > 0) { total = total + buffer_len(chunk); buffer_free(chunk); } else if (chunk < 0) { outcome = chunk; }
+    }
+    voice.queue_free(queue); stream_process_free(server);
+    if (outcome != -2 || total != 7680) { fs_remove(path); println("ffmpeg URL decoding failed", outcome, total); return 1; }
+    let state: int = buffer_new(); i = 0;
+    while (i < 344) { buffer_append(state, 0); i = i + 1; }
+    let roster: int = voice.queue_new(); voice.state_put(state, 17, roster);
+    voice.state_put(state, 2, buffer_from_string("123")); voice.state_put(state, 5, buffer_from_string("session")); voice.state_put(state, 6, buffer_from_string("tok\"en")); voice.state_put(state, 11, 8);
+    if (!str_eq(voice.session_resume_payload(state), "{\"op\":7,\"d\":{\"server_id\":\"123\",\"session_id\":\"session\",\"token\":\"tok\\\"en\",\"seq_ack\":7}}")) { println("voice resume payload failed"); return 1; }
+    voice.state_put(state, 37, 1);
+    if (voice.session_event(state, "{\"op\":9,\"d\":null}") != 0 || voice.state_get(state, 37) != 0) { println("voice resume state failed"); return 1; }
+    voice.state_put(state, 18, 1); voice.state_put(state, 37, 1); voice.state_put(state, 42, monotonic_now_ms() - 1);
+    if (voice.session_poll(state, 0) != -1 || voice.state_get(state, 18) != 2) { println("voice resume deadline failed"); return 1; }
+    voice.state_put(state, 37, 0); voice.state_put(state, 18, 0);
+    if (voice.session_event(state, "{\"op\":8,\"d\":{\"heartbeat_interval\":1000}}") != 0 || gateway_client.get(state, 8) != 1000 || gateway_client.get(state, 10) != 1) { println("voice heartbeat state failed"); return 1; }
+    if (voice.session_event(state, "{\"op\":11,\"d\":{\"user_ids\":[\"10\",\"20\"]}}") != 0) { println("voice roster event failed"); return 1; }
+    if (voice.session_event(state, "{\"op\":13,\"d\":{\"user_id\":\"10\"}}") != 0) { println("voice roster removal failed"); return 1; }
+    let item: int = gateway_client.get(roster, 0);
+    let member: string = buffer_string(gateway_client.get(item, 1));
+    if (item <= 0 || !str_eq(member, "20") || gateway_client.get(item, 0) != 0) { println("voice roster state failed", item, member, gateway_client.get(item, 0)); return 1; }
+    voice.state_put(state, 16, 42); voice.state_put(state, 22, 43); voice.state_put(state, 33, 42); voice.state_put(state, 34, 2); voice.state_put(state, 35, 2);
+    if (voice.session_activate(state) != 0 || voice.state_get(state, 22) != 43) { println("repeated transition replaced media"); return 1; }
+    voice.state_put(state, 16, 0); voice.state_put(state, 22, 0);
+    voice.state_put(state, 39, 1);
+    if (voice.session_event(state, "{\"op\":21,\"d\":{\"transition_id\":0,\"protocol_version\":0}}") != 0 || voice.state_get(state, 39) != 0 || voice.state_get(state, 19) != 4) { println("voice lifecycle failed"); return 1; }
+    let port: int = 0; let sink: int = -1; i = 0;
+    while (sink < 0 && i < 20) { port = 45000 + random_bounded(15000); sink = net_udp_open(port); i = i + 1; }
+    let source: int = net_udp_open(0); key = buffer_new(); i = 0; while (i < 32) { buffer_append(key, i); i = i + 1; }
+    let host: int = buffer_from_string("127.0.0.1"); frame = buffer_new(); buffer_append(frame, 248); buffer_append(frame, 255); buffer_append(frame, 254);
+    if (sink < 0 || source < 0 || host < 0 || key < 0 || frame < 0) { return 1; }
+    voice.state_put(state, 1, source); voice.state_put(state, 12, 123); voice.state_put(state, 13, host); voice.state_put(state, 14, port);
+    voice.state_put(state, 15, key); voice.state_put(state, 32, 1);
+    if (voice.session_send_frame(state, frame) != 0) { println("local voice UDP send failed"); return 1; }
+    voice.state_put(state, 12, 456);
+    if (voice.session_send_frame(state, frame) != 0) { return 1; }
+    packet = net_udp_recv(sink, 1000); if (packet <= 0 || voice.packet_ssrc(packet) != 123) { println("local voice UDP receive failed"); return 1; }
+    plain = voice.transport_decrypt(key, packet);
+    if (plain < 0 || buffer_len(plain) != 3 || buffer_get(plain, 0) != 248 || buffer_get(plain, 2) != 254) { println("local voice UDP decode failed"); return 1; }
+    let stage_receiver: int = voice.session_receiver(state, "123"); let stage_pcm: int = voice.session_decode_packet(state, stage_receiver, packet);
+    if (stage_receiver < 0 || stage_pcm < 0 || buffer_len(stage_pcm) != 3840) { println("transport-only receiver failed"); return 1; }
+    buffer_free(stage_pcm); voice.session_receiver_free(stage_receiver);
+    buffer_free(plain); buffer_free(packet);
+    packet = net_udp_recv(sink, 1000); if (packet <= 0 || voice.packet_ssrc(packet) != 456) { println("voice SSRC routing failed"); return 1; }
+    buffer_free(packet); buffer_free(frame);
+    voice.state_put(state, 18, 1);
+    if (voice.session_enqueue(state, path) != 0) { return 1; }
+    deadline = monotonic_now_ms() + 5000; outcome = 0;
+    while (outcome == 0 && monotonic_now_ms() < deadline) { outcome = voice.session_audio_tick(state); }
+    if (outcome != 1) { println("offline music frame failed"); return 1; }
+    packet = net_udp_recv(sink, 1000); if (packet <= 0) { return 1; }
+    plain = voice.transport_decrypt(key, packet); let decoder: int = opus_decoder_new(48000, 2);
+    let pcm: int = opus_decode(decoder, plain, 960);
+    if (pcm <= 0 || buffer_len(pcm) != 3840) { println("offline music decode failed"); return 1; }
+    buffer_free(pcm); opus_decoder_free(decoder); buffer_free(plain); buffer_free(packet); net_udp_close(sink); fs_remove(path);
+    if (voice.session_close(state) != 0) { return 1; }
+    println("voice offline tests passed"); return 0;
+}

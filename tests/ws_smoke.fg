@@ -1,0 +1,48 @@
+import net;
+import thread;
+import strings;
+import voice;
+import ws_peer;
+extern fn fr_tls_listen(host: string, port: int, cert: string, key: string): int;
+extern fn fr_tls_port(listener: int): int;
+extern fn fr_tls_accept(listener: int, timeout_ms: int): int;
+extern fn fr_tls_close(handle: int): int;
+
+fn peer(args: int): int {
+    let listener: int = voice.state_get(args, 0);
+    let connection: int = fr_tls_accept(listener, 10000);
+    let result: int = -1;
+    if (connection > 0 && ws_peer.handshake(connection) == 0) {
+        let frame: int = ws_peer.read_frame(connection);
+        if (frame > 0 && buffer_get(frame, 0) == 1) {
+            let body: int = buffer_slice(frame, 1, buffer_len(frame) - 1);
+            if (body > 0 && str_eq(buffer_string(body), "fixture ping") && ws_peer.send_text(connection, "fixture pong") == 0) { result = 0; }
+            if (body > 0) { buffer_free(body); }
+        }
+        if (frame > 0) { buffer_free(frame); }
+    }
+    if (connection > 0) { fr_tls_close(connection); }
+    if (result == 0) { voice.state_put(args, 1, 1); } else { voice.state_put(args, 1, 2); }
+    return result;
+}
+
+native main {
+    let listener: int = fr_tls_listen("127.0.0.1", 0, "build/fixture-cert.pem", "build/fixture-key.pem");
+    if (listener < 0) { println("TLS listener failed"); return 1; }
+    let port: int = fr_tls_port(listener);
+    let args: int = buffer_new(); let i: int = 0; while (i < 16) { buffer_append(args, 0); i = i + 1; }
+    voice.state_put(args, 0, listener);
+    let thread: int = thread_spawn(peer, args);
+    let url: string = str_concat(str_concat("wss://localhost:", str_from_int(port)), "/");
+    let ws: int = net_ws_open(url, "", 10000);
+    if (thread < 0 || ws < 0) { println("WSS connection failed"); return 1; }
+    let message: int = buffer_from_string("fixture ping");
+    if (net_ws_send(ws, message, 0, 10000) < 0) { println("WSS send failed"); return 1; }
+    buffer_free(message);
+    let response: int = net_ws_recv(ws, 10000);
+    if (response <= 0 || net_ws_kind(ws) != 1 || !str_eq(buffer_string(response), "fixture pong")) { println("WSS response failed"); return 1; }
+    buffer_free(response); net_ws_close(ws); thread_join(thread); fr_tls_close(listener);
+    let status: int = voice.state_get(args, 1); buffer_free(args);
+    if (status != 1) { println("WSS peer failed"); return 1; }
+    println("Local TLS WebSocket fixture passed"); return 0;
+}

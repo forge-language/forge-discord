@@ -1,0 +1,736 @@
+import strings;
+import discord;
+import net;
+import audio_crypto;
+import audio_process;
+import dave;
+import json;
+
+extern fn fr_dave_set_version(session: int, version: int): int;
+extern fn fr_dave_decryptor_refresh(media: int, session: int, user: string): int;
+extern fn fr_dave_decryptor_plain_new(): int;
+extern fn fr_dave_decryptor_passthrough(media: int, enabled: int): int;
+extern fn fr_dave_decryptor_expire(media: int): int;
+
+fn state_put(state: int, slot: int, value: int): int {
+    if (value < 0 || slot < 0 || slot * 8 + 8 > buffer_len(state)) { return -1; }
+    let i: int = 0;
+    while (i < 8) { if (buffer_set(state, slot * 8 + i, value % 256) < 0) { return -1; } value = value / 256; i = i + 1; }
+    return 0;
+}
+
+fn state_get(state: int, slot: int): int {
+    if (slot < 0 || slot * 8 + 8 > buffer_len(state)) { return -1; }
+    let value: int = 0; let i: int = 7;
+    while (i >= 0) { let c: int = buffer_get(state, slot * 8 + i); if (c < 0 || (i == 7 && c > 127)) { return -1; } value = value * 256 + c; i = i - 1; }
+    return value;
+}
+
+fn state_update(guild: string, channel: string): string {
+    if (discord.id_valid(guild) == 0 || (str_len(channel) > 0 && discord.id_valid(channel) == 0)) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":4,\"d\":{\"guild_id\":"); str_builder_append(b, discord.quote(guild));
+    str_builder_append(b, ",\"channel_id\":");
+    if (str_len(channel) == 0) { str_builder_append(b, "null"); } else { str_builder_append(b, discord.quote(channel)); }
+    str_builder_append(b, ",\"self_mute\":false,\"self_deaf\":false}}"); return str_builder_finish(b);
+}
+
+fn identify(guild: string, user: string, session: string, token: string, version: int): string {
+    if (discord.id_valid(guild) == 0 || discord.id_valid(user) == 0 || str_len(session) == 0 || str_len(token) == 0 || version < 1) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":0,\"d\":{\"server_id\":"); str_builder_append(b, discord.quote(guild));
+    str_builder_append(b, ",\"user_id\":"); str_builder_append(b, discord.quote(user));
+    str_builder_append(b, ",\"session_id\":"); str_builder_append(b, discord.quote(session));
+    str_builder_append(b, ",\"token\":"); str_builder_append(b, discord.quote(token));
+    str_builder_append(b, ",\"max_dave_protocol_version\":"); str_builder_append(b, str_from_int(version));
+    str_builder_append(b, "}}"); return str_builder_finish(b);
+}
+
+fn heartbeat(nonce: int, sequence: int): string {
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":3,\"d\":{\"t\":"); str_builder_append(b, str_from_int(nonce));
+    str_builder_append(b, ",\"seq_ack\":"); str_builder_append(b, str_from_int(sequence));
+    str_builder_append(b, "}}"); return str_builder_finish(b);
+}
+
+fn discovery_request(ssrc: int): int {
+    if (ssrc < 0 || ssrc > 4294967295) { return -1; }
+    let b: int = buffer_new();
+    if (b < 0) { return -1; }
+    buffer_append(b, 0); buffer_append(b, 1); buffer_append(b, 0); buffer_append(b, 70);
+    buffer_append(b, (ssrc / 16777216) % 256); buffer_append(b, (ssrc / 65536) % 256);
+    buffer_append(b, (ssrc / 256) % 256); buffer_append(b, ssrc % 256);
+    let i: int = 0;
+    while (i < 66) { buffer_append(b, 0); i = i + 1; }
+    return b;
+}
+
+fn discovery_port(packet: int, ssrc: int): int {
+    if (buffer_len(packet) != 74 || buffer_get(packet, 0) != 0 || buffer_get(packet, 1) != 2 || buffer_get(packet, 2) != 0 || buffer_get(packet, 3) != 70 || ssrc < 0 || ssrc > 4294967295) { return -1; }
+    let actual: int = buffer_get(packet, 4) * 16777216 + buffer_get(packet, 5) * 65536 + buffer_get(packet, 6) * 256 + buffer_get(packet, 7);
+    if (actual != ssrc) { return -1; }
+    let port: int = buffer_get(packet, 72) * 256 + buffer_get(packet, 73);
+    if (port == 0) { return -1; }
+    return port;
+}
+
+fn discovery_address(packet: int, ssrc: int): string {
+    if (discovery_port(packet, ssrc) < 0) { return ""; }
+    let b: int = str_builder(); let i: int = 8;
+    while (i < 72 && buffer_get(packet, i) != 0) {
+        let c: int = buffer_get(packet, i);
+        if ((c < 48 || c > 57) && c != 46 && c != 58 && (c < 65 || c > 70) && (c < 97 || c > 102)) { return ""; }
+        str_builder_char(b, c); i = i + 1;
+    }
+    if (i == 8 || i == 72) { return ""; }
+    return str_builder_finish(b);
+}
+
+fn select_protocol(address: string, port: int): string {
+    if (str_len(address) == 0 || port < 1 || port > 65535) { return ""; }
+    let b: int = str_builder();
+    str_builder_append(b, "{\"op\":1,\"d\":{\"protocol\":\"udp\",\"data\":{\"address\":");
+    str_builder_append(b, discord.quote(address)); str_builder_append(b, ",\"port\":"); str_builder_append(b, str_from_int(port));
+    str_builder_append(b, ",\"mode\":\"aead_xchacha20_poly1305_rtpsize\"}}}"); return str_builder_finish(b);
+}
+
+fn append_u32(buffer: int, value: int): int {
+    if (value < 0 || value > 4294967295) { return -1; }
+    if (buffer_append(buffer, (value / 16777216) % 256) < 0 || buffer_append(buffer, (value / 65536) % 256) < 0 || buffer_append(buffer, (value / 256) % 256) < 0 || buffer_append(buffer, value % 256) < 0) { return -1; }
+    return 0;
+}
+
+fn transport_packet(key: int, frame: int, sequence: int, timestamp: int, ssrc: int, counter: int): int {
+    if (buffer_len(key) != 32 || buffer_len(frame) < 0 || sequence < 0 || sequence > 65535 || timestamp < 0 || timestamp > 4294967295 || ssrc < 0 || ssrc > 4294967295 || counter < 0 || counter > 4294967295) { return -1; }
+    let header: int = buffer_new(); let nonce: int = buffer_new();
+    if (header < 0 || nonce < 0) { if (header > 0) { buffer_free(header); } if (nonce > 0) { buffer_free(nonce); } return -1; }
+    if (buffer_append(header, 128) < 0 || buffer_append(header, 120) < 0 || buffer_append(header, sequence / 256) < 0 || buffer_append(header, sequence % 256) < 0 || append_u32(header, timestamp) < 0 || append_u32(header, ssrc) < 0 || append_u32(nonce, counter) < 0) { buffer_free(header); buffer_free(nonce); return -1; }
+    let i: int = 0;
+    while (i < 20) { if (buffer_append(nonce, 0) < 0) { buffer_free(header); buffer_free(nonce); return -1; } i = i + 1; }
+    let encrypted: int = xchacha_encrypt(key, nonce, header, frame); buffer_free(nonce);
+    if (encrypted < 0) { buffer_free(header); return -1; }
+    if (buffer_append_buffer(header, encrypted) < 0 || append_u32(header, counter) < 0) { buffer_free(encrypted); buffer_free(header); return -1; }
+    buffer_free(encrypted); return header;
+}
+
+fn transport_decrypt(key: int, packet: int): int {
+    let length: int = buffer_len(packet);
+    if (buffer_len(key) != 32 || length < 32 || buffer_get(packet, 0) / 64 != 2) { return -1; }
+    let flags: int = buffer_get(packet, 0); let header_len: int = 12 + (flags % 16) * 4;
+    if ((flags / 16) % 2 != 0) { header_len = header_len + 4; }
+    if (header_len + 20 > length) { return -1; }
+    let header: int = buffer_slice(packet, 0, header_len);
+    let encrypted: int = buffer_slice(packet, header_len, length - header_len - 4);
+    let nonce: int = buffer_slice(packet, length - 4, 4);
+    if (header < 0 || encrypted < 0 || nonce < 0) { if (header > 0) { buffer_free(header); } if (encrypted > 0) { buffer_free(encrypted); } if (nonce > 0) { buffer_free(nonce); } return -1; }
+    let i: int = 0;
+    while (i < 20) { if (buffer_append(nonce, 0) < 0) { buffer_free(header); buffer_free(encrypted); buffer_free(nonce); return -1; } i = i + 1; }
+    let plain: int = xchacha_decrypt(key, nonce, header, encrypted);
+    buffer_free(encrypted); buffer_free(nonce);
+    if (plain < 0) { buffer_free(header); return -1; }
+    let skip: int = 0;
+    if ((flags / 16) % 2 != 0) { skip = (buffer_get(header, header_len - 2) * 256 + buffer_get(header, header_len - 1)) * 4; }
+    buffer_free(header);
+    let plain_len: int = buffer_len(plain);
+    if (skip > plain_len) { buffer_free(plain); return -1; }
+    let payload_len: int = plain_len - skip;
+    if ((flags / 32) % 2 != 0) {
+        if (payload_len == 0) { buffer_free(plain); return -1; }
+        let padding: int = buffer_get(plain, plain_len - 1);
+        if (padding == 0 || padding > payload_len) { buffer_free(plain); return -1; }
+        payload_len = payload_len - padding;
+    }
+    let result: int = buffer_slice(plain, skip, payload_len); buffer_free(plain); return result;
+}
+
+fn music_decoder(source: string): int {
+    if (str_len(source) == 0 || str_contains(source, "\n") || str_contains(source, "\r")) { return -1; }
+    let child: int = stream_process_new("ffmpeg");
+    if (child < 0) { return -1; }
+    if (stream_process_arg(child, "-nostdin") < 0 || stream_process_arg(child, "-v") < 0 || stream_process_arg(child, "error") < 0 || stream_process_arg(child, "-i") < 0 || stream_process_arg(child, source) < 0 || stream_process_arg(child, "-f") < 0 || stream_process_arg(child, "s16le") < 0 || stream_process_arg(child, "-ar") < 0 || stream_process_arg(child, "48000") < 0 || stream_process_arg(child, "-ac") < 0 || stream_process_arg(child, "2") < 0 || stream_process_arg(child, "pipe:1") < 0 || stream_process_start(child) < 0) { stream_process_free(child); return -1; }
+    return child;
+}
+
+fn dave_key_message(session: int): int {
+    let key: int = dave_key_package(session);
+    if (key < 0) { return -1; }
+    let message: int = buffer_new();
+    if (message < 0) { buffer_free(key); return -1; }
+    if (buffer_append(message, 26) < 0 || buffer_append_buffer(message, key) < 0) { buffer_free(key); buffer_free(message); return -1; }
+    buffer_free(key); return message;
+}
+
+fn dave_sequence(message: int): int {
+    if (buffer_len(message) < 3) { return -1; }
+    return buffer_get(message, 0) * 256 + buffer_get(message, 1);
+}
+
+fn dave_transition(message: int): int {
+    if (buffer_len(message) < 5 || (buffer_get(message, 2) != 29 && buffer_get(message, 2) != 30)) { return -1; }
+    return buffer_get(message, 3) * 256 + buffer_get(message, 4);
+}
+
+fn dave_binary(session: int, message: int): int {
+    let len: int = buffer_len(message);
+    if (len < 4) { return -1; }
+    let op: int = buffer_get(message, 2);
+    let offset: int = 3;
+    if (op == 29 || op == 30) { offset = 5; }
+    if (offset >= len || (op != 25 && op != 27 && op != 29 && op != 30)) { return -1; }
+    let body: int = buffer_slice(message, offset, len - offset);
+    if (body < 0) { return -1; }
+    if (op == 25) { let status: int = dave_external_sender(session, body); buffer_free(body); if (status < 0) { return -1; } return buffer_new(); }
+    if (op == 27) {
+        let commit: int = dave_proposals(session, body); buffer_free(body);
+        if (commit < 0) { return -1; }
+        if (buffer_len(commit) == 0) { return commit; }
+        let reply: int = buffer_new();
+        if (reply < 0) { buffer_free(commit); return -1; }
+        if (buffer_append(reply, 28) < 0 || buffer_append_buffer(reply, commit) < 0) { buffer_free(commit); buffer_free(reply); return -1; }
+        buffer_free(commit); return reply;
+    }
+    let result: int = -1;
+    if (op == 29) { result = dave_commit(session, body); } else { result = dave_welcome(session, body); }
+    buffer_free(body);
+    if (result < 0) { return -1; }
+    let transition: int = dave_transition(message);
+    if (transition == 0 || result == 1) { return buffer_new(); }
+    let payload: string = str_concat(str_concat("{\"op\":23,\"d\":{\"transition_id\":", str_from_int(transition)), "}}");
+    return buffer_from_string(payload);
+}
+
+fn queue_new(): int {
+    let queue: int = buffer_new(); if (queue < 0) { return -1; }
+    let i: int = 0;
+    while (i < 32) { if (buffer_append(queue, 0) < 0) { buffer_free(queue); return -1; } i = i + 1; }
+    return queue;
+}
+
+fn queue_add(queue: int, source: string): int {
+    if (buffer_len(queue) != 32 || str_len(source) == 0 || str_contains(source, "\n") || str_contains(source, "\r")) { return -1; }
+    let item: int = buffer_new(); let text: int = buffer_from_string(source);
+    if (item < 0 || text < 0) { if (item > 0) { buffer_free(item); } if (text > 0) { buffer_free(text); } return -1; }
+    let i: int = 0;
+    while (i < 16) { if (buffer_append(item, 0) < 0) { buffer_free(text); buffer_free(item); return -1; } i = i + 1; }
+    if (state_put(item, 1, text) < 0) { buffer_free(text); buffer_free(item); return -1; }
+    let tail: int = state_get(queue, 1);
+    if (tail > 0) { state_put(tail, 0, item); } else { state_put(queue, 0, item); }
+    state_put(queue, 1, item); return 0;
+}
+
+fn queue_skip(queue: int): int {
+    if (buffer_len(queue) != 32) { return -1; }
+    let child: int = state_get(queue, 2);
+    if (child > 0) { stream_process_free(child); state_put(queue, 2, 0); }
+    return 0;
+}
+
+fn queue_next(queue: int): int {
+    if (buffer_len(queue) != 32 || state_get(queue, 2) != 0) { return -1; }
+    if (state_get(queue, 3) != 0) { return 0; }
+    let item: int = state_get(queue, 0); if (item == 0) { return 0; }
+    let next: int = state_get(item, 0); let text: int = state_get(item, 1);
+    let child: int = music_decoder(buffer_string(text));
+    state_put(queue, 0, next); if (next == 0) { state_put(queue, 1, 0); }
+    buffer_free(text); buffer_free(item);
+    if (child < 0) { return -1; }
+    state_put(queue, 2, child); return child;
+}
+
+fn queue_pause(queue: int): int { if (buffer_len(queue) != 32) { return -1; } return state_put(queue, 3, 1); }
+fn queue_resume(queue: int): int { if (buffer_len(queue) != 32) { return -1; } return state_put(queue, 3, 0); }
+
+fn queue_read(queue: int, max_bytes: int, timeout_ms: int): int {
+    if (buffer_len(queue) != 32 || state_get(queue, 2) == 0) { return -1; }
+    if (state_get(queue, 3) != 0) { return 0; }
+    let child: int = state_get(queue, 2);
+    let data: int = stream_process_read(child, max_bytes, timeout_ms);
+    if (data != -2) { return data; }
+    let status: int = stream_process_status(child);
+    if (status == -2) { return 0; }
+    queue_skip(queue);
+    if (status == 0) { return -2; }
+    return -3;
+}
+
+fn queue_stop(queue: int): int {
+    if (buffer_len(queue) != 32) { return -1; }
+    queue_skip(queue); let item: int = state_get(queue, 0);
+    while (item > 0) { let next: int = state_get(item, 0); buffer_free(state_get(item, 1)); buffer_free(item); item = next; }
+    state_put(queue, 0, 0); state_put(queue, 1, 0); state_put(queue, 3, 0); return 0;
+}
+
+fn queue_free(queue: int): int { if (queue_stop(queue) < 0) { return -1; } return buffer_free(queue); }
+
+fn session_send(state: int, message: int, binary: int): int {
+    return net_ws_send(state_get(state, 0), message, binary, 10000);
+}
+
+fn session_send_text(state: int, payload: string): int {
+    let message: int = buffer_from_string(payload); if (message < 0) { return -1; }
+    let status: int = session_send(state, message, 0); buffer_free(message); return status;
+}
+
+fn session_resume_payload(state: int): string {
+    let b: int = str_builder(); str_builder_append(b, "{\"op\":7,\"d\":{\"server_id\":"); str_builder_append(b, discord.quote(buffer_string(state_get(state, 2))));
+    str_builder_append(b, ",\"session_id\":"); str_builder_append(b, discord.quote(buffer_string(state_get(state, 5))));
+    str_builder_append(b, ",\"token\":"); str_builder_append(b, discord.quote(buffer_string(state_get(state, 6))));
+    str_builder_append(b, ",\"seq_ack\":"); str_builder_append(b, str_from_int(state_get(state, 11) - 1)); str_builder_append(b, "}}"); return str_builder_finish(b);
+}
+
+fn session_reconnect(state: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 19) < 3) { return -1; }
+    let old: int = state_get(state, 0); if (old > 0) { net_ws_close(old); state_put(state, 0, 0); }
+    let ws: int = net_ws_open(str_concat(str_concat("wss://", buffer_string(state_get(state, 7))), "/?v=8"), "", 15000);
+    if (ws < 0) { return -1; }
+    state_put(state, 0, ws); state_put(state, 9, 0); state_put(state, 10, 1); state_put(state, 18, 1); state_put(state, 37, 1); state_put(state, 42, monotonic_now_ms() + 15000);
+    if (session_send_text(state, session_resume_payload(state)) < 0) { net_ws_close(ws); state_put(state, 0, 0); return -1; }
+    return 0;
+}
+
+fn session_close(state: int): int {
+    if (buffer_len(state) != 344) { return -1; }
+    let ws: int = state_get(state, 0); if (ws > 0) { net_ws_close(ws); }
+    let udp: int = state_get(state, 1); if (udp > 0) { net_udp_close(udp); }
+    let i: int = 2;
+    while (i <= 7) { let h: int = state_get(state, i); if (h > 0) { buffer_free(h); } i = i + 1; }
+    let host: int = state_get(state, 13); if (host > 0) { buffer_free(host); }
+    let key: int = state_get(state, 15); if (key > 0) { buffer_free(key); }
+    let dave_session: int = state_get(state, 16); if (dave_session > 0) { dave_free(dave_session); }
+    let roster: int = state_get(state, 17); if (roster > 0) { queue_free(roster); }
+    let sender: int = state_get(state, 20); if (sender > 0) { buffer_free(sender); }
+    let media: int = state_get(state, 22); if (media > 0) { dave_media_free(media); }
+    let encoder: int = state_get(state, 28); if (encoder > 0) { opus_encoder_free(encoder); }
+    let queue: int = state_get(state, 29); if (queue > 0) { queue_free(queue); }
+    let pcm: int = state_get(state, 30); if (pcm > 0) { buffer_free(pcm); }
+    let event: int = state_get(state, 38); if (event > 0) { buffer_free(event); }
+    return buffer_free(state);
+}
+
+fn session_open(endpoint: string, guild: string, channel: string, user: string, session: string, token: string): int {
+    if (str_len(endpoint) == 0 || str_len(endpoint) > 253 || discord.id_valid(guild) == 0 || discord.id_valid(channel) == 0 || discord.id_valid(user) == 0 || str_len(identify(guild, user, session, token, dave_max_version())) == 0) { return -1; }
+    let i: int = 0;
+    while (i < str_len(endpoint)) {
+        let c: int = str_char_at(endpoint, i);
+        if ((c < 48 || c > 57) && (c < 65 || c > 90) && (c < 97 || c > 122) && c != 45 && c != 46 && c != 58) { return -1; }
+        i = i + 1;
+    }
+    let state: int = buffer_new(); if (state < 0) { return -1; }
+    i = 0; while (i < 344) { if (buffer_append(state, 0) < 0) { buffer_free(state); return -1; } i = i + 1; }
+    let g: int = buffer_from_string(guild); let ch: int = buffer_from_string(channel); let u: int = buffer_from_string(user);
+    let s: int = buffer_from_string(session); let t: int = buffer_from_string(token); let ep: int = buffer_from_string(endpoint);
+    if (g < 0 || ch < 0 || u < 0 || s < 0 || t < 0 || ep < 0) {
+        if (g > 0) { buffer_free(g); } if (ch > 0) { buffer_free(ch); } if (u > 0) { buffer_free(u); }
+        if (s > 0) { buffer_free(s); } if (t > 0) { buffer_free(t); } if (ep > 0) { buffer_free(ep); }
+        buffer_free(state); return -1;
+    }
+    state_put(state, 2, g); state_put(state, 3, ch); state_put(state, 4, u);
+    state_put(state, 5, s); state_put(state, 6, t); state_put(state, 7, ep);
+    let roster: int = queue_new(); if (roster < 0) { session_close(state); return -1; }
+    state_put(state, 17, roster);
+    let ws: int = net_ws_open(str_concat(str_concat("wss://", endpoint), "/?v=8"), "", 15000);
+    if (ws < 0) { session_close(state); return -1; }
+    state_put(state, 0, ws); state_put(state, 10, 1); state_put(state, 18, 1);
+    if (session_send_text(state, identify(guild, user, session, token, dave_max_version())) < 0) { session_close(state); return -1; }
+    return state;
+}
+
+fn session_discover(state: int): int {
+    let udp: int = state_get(state, 1); if (udp == 0 || state_get(state, 19) != 1) { return 0; }
+    if (monotonic_now_ms() >= state_get(state, 41)) { return -1; }
+    let response: int = net_udp_recv(udp, 0); if (response == 0) { return 0; } if (response < 0) { return -1; }
+    if (!str_eq(net_udp_host(udp), buffer_string(state_get(state, 13))) || net_udp_port(udp) != state_get(state, 14)) { buffer_free(response); return 0; }
+    let port: int = discovery_port(response, state_get(state, 12));
+    let address: string = discovery_address(response, state_get(state, 12));
+    let payload: string = select_protocol(address, port); buffer_free(response);
+    if (str_len(payload) == 0 || session_send_text(state, payload) < 0) { return -1; }
+    state_put(state, 19, 2); return 1;
+}
+
+fn session_ready(state: int, event: string): int {
+    if (state_get(state, 1) != 0) { return -1; }
+    let ip: string = json_get_path_str(event, "d.ip");
+    let port: int = json_get_path_int(event, "d.port"); let ssrc: int = json_get_path_int(event, "d.ssrc");
+    let modes: string = json_get_path(event, "d.modes"); let found: int = 0; let i: int = 0;
+    while (i < json_array_len(modes)) { if (str_eq(json_array_at(modes, i), "\"aead_xchacha20_poly1305_rtpsize\"")) { found = 1; } i = i + 1; }
+    if (str_len(ip) == 0 || port < 1 || port > 65535 || ssrc < 0 || ssrc > 4294967295 || found == 0) { return -1; }
+    let host: int = buffer_from_string(ip); let udp: int = net_udp_open(0); let request: int = discovery_request(ssrc);
+    if (host < 0 || udp < 0 || request < 0) { if (host > 0) { buffer_free(host); } if (udp > 0) { net_udp_close(udp); } if (request > 0) { buffer_free(request); } return -1; }
+    state_put(state, 1, udp); state_put(state, 12, ssrc); state_put(state, 13, host); state_put(state, 14, port);
+    let status: int = net_udp_send(udp, ip, port, request); buffer_free(request);
+    if (status < 0) { return -1; }
+    state_put(state, 19, 1); state_put(state, 41, monotonic_now_ms() + 10000); return 0;
+}
+
+fn session_description(state: int, event: string): int {
+    if (state_get(state, 19) != 2 || !str_eq(json_get_path_str(event, "d.mode"), "aead_xchacha20_poly1305_rtpsize")) { return -1; }
+    if (str_len(json_get_path(event, "d.dave_protocol_version")) == 0) { return -1; }
+    let version: int = json_get_path_int(event, "d.dave_protocol_version");
+    if (version < 0 || version > dave_max_version()) { return -1; }
+    let raw: string = json_get_path(event, "d.secret_key"); if (json_array_len(raw) != 32) { return -1; }
+    let key: int = buffer_new(); if (key < 0) { return -1; }
+    let i: int = 0;
+    while (i < 32) {
+        let value: string = json_array_at(raw, i);
+        if (discord.id_valid(value) == 0) { buffer_free(key); return -1; }
+        let n: int = json_get_path_int(str_concat(str_concat("{\"n\":", value), "}"), "n");
+        if (n < 0 || n > 255 || buffer_append(key, n) < 0) { buffer_free(key); return -1; }
+        i = i + 1;
+    }
+    if (version == 0) { state_put(state, 15, key); state_put(state, 39, 0); state_put(state, 19, 4); return 0; }
+    let dave_session: int = dave_new(version, buffer_string(state_get(state, 3)), buffer_string(state_get(state, 4)));
+    if (dave_session < 0) { buffer_free(key); return -1; }
+    state_put(state, 15, key); state_put(state, 16, dave_session); state_put(state, 21, version);
+    state_put(state, 34, 1);
+    state_put(state, 36, 1);
+    let item: int = state_get(state_get(state, 17), 0);
+    while (item > 0) { if (dave_add_user(dave_session, buffer_string(state_get(item, 1))) < 0) { return -1; } item = state_get(item, 0); }
+    let sender: int = state_get(state, 20);
+    if (sender > 0 && dave_external_sender(dave_session, sender) < 0) { return -1; }
+    let package: int = dave_key_message(dave_session); if (package < 0) { return -1; }
+    let status: int = session_send(state, package, 1); buffer_free(package);
+    if (status < 0) { return -1; }
+    state_put(state, 19, 3); return 0;
+}
+
+fn roster_change(state: int, user: string, add: int): int {
+    if (discord.id_valid(user) == 0) { return -1; }
+    let roster: int = state_get(state, 17); let item: int = state_get(roster, 0); let prev: int = 0;
+    while (item > 0 && !str_eq(buffer_string(state_get(item, 1)), user)) { prev = item; item = state_get(item, 0); }
+    let dave_session: int = state_get(state, 16);
+    if (add != 0 && item == 0) {
+        if (queue_add(roster, user) < 0) { return -1; }
+        if (dave_session > 0 && dave_add_user(dave_session, user) < 0) { return -1; }
+    }
+    if (add == 0 && item > 0) {
+        let next: int = state_get(item, 0);
+        if (prev == 0) { state_put(roster, 0, next); } else { state_put(prev, 0, next); }
+        if (state_get(roster, 1) == item) { state_put(roster, 1, prev); }
+        buffer_free(state_get(item, 1)); buffer_free(item);
+        if (dave_session > 0 && dave_remove_user(dave_session, user) < 0) { return -1; }
+    }
+    return 0;
+}
+
+fn session_binary(state: int, message: int): int {
+    if (buffer_len(message) < 4) { return -1; }
+    let seq: int = dave_sequence(message); let previous: int = state_get(state, 11);
+    if (previous > 0) { let distance: int = (seq - (previous - 1) + 65536) % 65536; if (distance == 0 || distance >= 32768) { return 0; } }
+    state_put(state, 11, seq + 1);
+    let op: int = buffer_get(message, 2); let dave_session: int = state_get(state, 16);
+    if (op == 25 && dave_session == 0) {
+        let sender: int = buffer_slice(message, 3, buffer_len(message) - 3);
+        if (sender < 0) { return -1; }
+        let old: int = state_get(state, 20); if (old > 0) { buffer_free(old); }
+        state_put(state, 20, sender); return 0;
+    }
+    if (dave_session == 0) { return -1; }
+    if (op == 25) {
+        let sender: int = buffer_slice(message, 3, buffer_len(message) - 3); if (sender < 0) { return -1; }
+        if (dave_external_sender(dave_session, sender) < 0) { buffer_free(sender); return -1; }
+        let old: int = state_get(state, 20); if (old > 0) { buffer_free(old); }
+        state_put(state, 20, sender); return 0;
+    }
+    if (op == 29 || op == 30) {
+        let transition: int = dave_transition(message);
+        if (transition < 0 || buffer_len(message) <= 5) { return -1; }
+        let body: int = buffer_slice(message, 5, buffer_len(message) - 5); if (body < 0) { return -1; }
+        let status: int = -1;
+        if (op == 29) { status = dave_commit(dave_session, body); } else { status = dave_welcome(dave_session, body); }
+        buffer_free(body);
+        if (status == 1) { return 0; }
+        if (status < 0) {
+            let error: string = str_concat(str_concat("{\"op\":31,\"d\":{\"transition_id\":", str_from_int(transition)), "}}");
+            if (session_send_text(state, error) < 0) { return -1; }
+            return session_epoch(state, state_get(state, 21), 1);
+        }
+        state_put(state, 34, state_get(state, 34) + 1);
+        state_put(state, 36, 0);
+        state_put(state, 40, state_get(state, 21) + 1);
+        if (transition == 0) { return session_activate(state); }
+        let ready: string = str_concat(str_concat("{\"op\":23,\"d\":{\"transition_id\":", str_from_int(transition)), "}}");
+        if (session_send_text(state, ready) < 0) { return -1; }
+        state_put(state, 23, transition + 1); return 0;
+    }
+    let reply: int = dave_binary(dave_session, message);
+    if (reply < 0) { return -1; }
+    let len: int = buffer_len(reply); let rc: int = 0;
+    if (len > 0) { if (op == 27) { rc = session_send(state, reply, 1); } else { rc = session_send(state, reply, 0); state_put(state, 23, dave_transition(message) + 1); } }
+    buffer_free(reply);
+    return rc;
+}
+
+fn session_activate(state: int): int {
+    if (state_get(state, 40) == 1) {
+        let old: int = state_get(state, 22); if (old > 0) { dave_media_free(old); state_put(state, 22, 0); }
+        state_put(state, 39, 0); state_put(state, 40, 0); state_put(state, 23, 0); state_put(state, 19, 4); return 0;
+    }
+    let dave_session: int = state_get(state, 16);
+    if (state_get(state, 22) > 0 && state_get(state, 33) == dave_session && state_get(state, 35) == state_get(state, 34)) { state_put(state, 23, 0); state_put(state, 40, 0); return 0; }
+    let media: int = dave_encryptor_new(dave_session, buffer_string(state_get(state, 4)), state_get(state, 12));
+    if (media < 0) { return -1; }
+    let old: int = state_get(state, 22); if (old > 0) { dave_media_free(old); }
+    state_put(state, 22, media); state_put(state, 23, 0); state_put(state, 19, 4);
+    state_put(state, 33, dave_session); state_put(state, 35, state_get(state, 34));
+    state_put(state, 39, state_get(state, 21)); state_put(state, 40, 0); return 0;
+}
+
+fn session_epoch(state: int, version: int, epoch: int): int {
+    if (version < 1 || version > dave_max_version() || epoch < 1) { return -1; }
+    let old: int = state_get(state, 16);
+    if (epoch != 1) {
+        if (old == 0 || fr_dave_set_version(old, version) < 0) { return -1; }
+        state_put(state, 21, version); return 0;
+    }
+    let fresh: int = dave_new(version, buffer_string(state_get(state, 3)), buffer_string(state_get(state, 4)));
+    if (fresh < 0) { return -1; }
+    let item: int = state_get(state_get(state, 17), 0);
+    while (item > 0) { if (dave_add_user(fresh, buffer_string(state_get(item, 1))) < 0) { dave_free(fresh); return -1; } item = state_get(item, 0); }
+    let sender: int = state_get(state, 20);
+    if (sender > 0 && dave_external_sender(fresh, sender) < 0) { dave_free(fresh); return -1; }
+    let package: int = dave_key_message(fresh); if (package < 0) { dave_free(fresh); return -1; }
+    let result: int = session_send(state, package, 1); buffer_free(package);
+    if (result < 0) { dave_free(fresh); return -1; }
+    if (old > 0) { dave_free(old); } state_put(state, 16, fresh); state_put(state, 21, version); state_put(state, 34, state_get(state, 34) + 1); state_put(state, 36, 1); return 0;
+}
+
+fn session_event(state: int, event: string): int {
+    if (str_len(json_get_path(event, "op")) == 0) { return -1; }
+    let op: int = json_get_path_int(event, "op");
+    if (str_len(json_get_path(event, "seq")) > 0) {
+        let seq: int = json_get_path_int(event, "seq"); let previous: int = state_get(state, 11);
+        if (seq < 0 || seq > 65535) { return -1; }
+        if (previous > 0) { let distance: int = (seq - (previous - 1) + 65536) % 65536; if (distance == 0 || distance >= 32768) { return 0; } }
+        state_put(state, 11, seq + 1);
+    }
+    if (op == 8) {
+        let interval: int = json_get_path_int(event, "d.heartbeat_interval"); if (interval <= 0) { return -1; }
+        state_put(state, 8, interval); state_put(state, 9, monotonic_now_ms() + interval); state_put(state, 10, 1); return 0;
+    }
+    if (op == 6) { state_put(state, 10, 1); return 0; }
+    if (op == 9) { state_put(state, 37, 0); state_put(state, 42, 0); return 0; }
+    if (op == 2) { return session_ready(state, event); }
+    if (op == 4) { return session_description(state, event); }
+    if (op == 11) {
+        let users: string = json_get_path(event, "d.user_ids"); let i: int = 0;
+        while (i < json_array_len(users)) {
+            let raw: string = json_array_at(users, i);
+            let user: string = json_get_path_str(str_concat(str_concat("{\"id\":", raw), "}"), "id");
+            if (roster_change(state, user, 1) < 0) { return -1; } i = i + 1;
+        }
+        return 0;
+    }
+    if (op == 13) { return roster_change(state, json_get_path_str(event, "d.user_id"), 0); }
+    if (op == 24) { return session_epoch(state, json_get_path_int(event, "d.protocol_version"), json_get_path_int(event, "d.epoch")); }
+    if (op == 21) {
+        if (str_len(json_get_path(event, "d.protocol_version")) == 0 || str_len(json_get_path(event, "d.transition_id")) == 0) { return -1; }
+        let transition: int = json_get_path_int(event, "d.transition_id"); let version: int = json_get_path_int(event, "d.protocol_version");
+        if (transition < 0 || transition > 65535 || version < 0 || version > dave_max_version()) { return -1; }
+        state_put(state, 40, version + 1);
+        if (transition == 0) {
+            if (version != 0 && state_get(state, 36) != 0) {
+                let media: int = state_get(state, 22); if (media > 0) { dave_media_free(media); state_put(state, 22, 0); }
+                state_put(state, 19, 3); return 0;
+            }
+            return session_activate(state);
+        }
+        let payload: string = str_concat(str_concat("{\"op\":23,\"d\":{\"transition_id\":", str_from_int(transition)), "}}");
+        if (session_send_text(state, payload) < 0) { return -1; }
+        state_put(state, 23, transition + 1); return 0;
+    }
+    if (op == 22) {
+        let transition: int = json_get_path_int(event, "d.transition_id");
+        if (transition < 0 || state_get(state, 23) != transition + 1) { return -1; }
+        return session_activate(state);
+    }
+    return 0;
+}
+
+fn session_poll(state: int, timeout_ms: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 18) != 1 || timeout_ms < 0) { return -1; }
+    if (session_audio_tick(state) < 0) { state_put(state, 18, 2); return -1; }
+    if (session_discover(state) < 0) { state_put(state, 18, 2); return -1; }
+    let now: int = monotonic_now_ms(); let due: int = state_get(state, 9);
+    if (state_get(state, 37) != 0 && now >= state_get(state, 42)) { state_put(state, 18, 2); return -1; }
+    if (due > 0 && now >= due) {
+        if (state_get(state, 10) == 0 || session_send_text(state, heartbeat(now, state_get(state, 11) - 1)) < 0) { if (session_reconnect(state) == 0) { return 0; } state_put(state, 18, 2); return -1; }
+        state_put(state, 10, 0); state_put(state, 9, now + state_get(state, 8));
+    }
+    due = state_get(state, 9); if (due > 0 && due - now < timeout_ms) { timeout_ms = due - now; }
+    if (state_get(state, 37) != 0 && state_get(state, 42) - now < timeout_ms) { timeout_ms = state_get(state, 42) - now; }
+    if (state_get(state, 19) == 1 && timeout_ms > 20) { timeout_ms = 20; }
+    if (state_get(state, 29) != 0 && timeout_ms > 20) { timeout_ms = 20; }
+    if (timeout_ms < 0) { timeout_ms = 0; }
+    let ws: int = state_get(state, 0); let frame: int = net_ws_recv(ws, timeout_ms);
+    if (frame == 0) { return 0; }
+    if (frame < 0) { if (session_reconnect(state) == 0) { return 0; } state_put(state, 18, 2); return -1; }
+    let kind: int = net_ws_kind(ws); let result: int = -1;
+    if (kind == 8) {
+        let code: int = 0; if (buffer_len(frame) >= 2) { code = buffer_get(frame, 0) * 256 + buffer_get(frame, 1); }
+        buffer_free(frame);
+        if (code != 4006 && code != 4009 && code != 4014 && session_reconnect(state) == 0) { return 0; }
+        state_put(state, 18, 2); return -1;
+    }
+    if (kind == 1) {
+        result = session_event(state, buffer_string(frame));
+        let previous: int = state_get(state, 38); if (previous > 0) { buffer_free(previous); }
+        let copy: int = buffer_slice(frame, 0, buffer_len(frame));
+        if (copy < 0) { result = -1; } else { state_put(state, 38, copy); }
+    }
+    if (kind == 2) { result = session_binary(state, frame); }
+    buffer_free(frame);
+    if (result < 0) { state_put(state, 18, 2); return -1; }
+    return 1;
+}
+
+fn session_enqueue(state: int, source: string): int {
+    if (buffer_len(state) != 344) { return -1; }
+    let queue: int = state_get(state, 29);
+    if (queue == 0) { queue = queue_new(); if (queue < 0) { return -1; } state_put(state, 29, queue); }
+    return queue_add(queue, source);
+}
+
+fn session_pause(state: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 29) == 0) { return -1; }
+    if (state_get(state, 32) != 0) { state_put(state, 31, 5); }
+    return queue_pause(state_get(state, 29));
+}
+
+fn session_resume(state: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 29) == 0) { return -1; }
+    return queue_resume(state_get(state, 29));
+}
+
+fn session_skip(state: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 29) == 0) { return -1; }
+    let pcm: int = state_get(state, 30); if (pcm > 0) { buffer_free(pcm); state_put(state, 30, 0); }
+    if (state_get(state, 32) != 0) { state_put(state, 31, 5); }
+    return queue_skip(state_get(state, 29));
+}
+
+fn session_stop(state: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 29) == 0) { return -1; }
+    session_skip(state); return queue_stop(state_get(state, 29));
+}
+
+fn session_speaking(state: int, speaking: int): int {
+    let b: int = str_builder(); str_builder_append(b, "{\"op\":5,\"d\":{\"speaking\":"); str_builder_append(b, str_from_int(speaking));
+    str_builder_append(b, ",\"delay\":0,\"ssrc\":"); str_builder_append(b, str_from_int(state_get(state, 12))); str_builder_append(b, "}}");
+    if (session_send_text(state, str_builder_finish(b)) < 0) { return -1; }
+    state_put(state, 32, speaking); return 0;
+}
+
+fn session_send_frame(state: int, frame: int): int {
+    if (state_get(state, 19) != 4 || (state_get(state, 39) != 0 && state_get(state, 22) == 0) || state_get(state, 26) > 4294967295) { return -1; }
+    if (state_get(state, 32) == 0 && session_speaking(state, 1) < 0) { return -1; }
+    let encrypted: int = 0;
+    if (state_get(state, 39) == 0) { encrypted = buffer_slice(frame, 0, buffer_len(frame)); } else { encrypted = dave_encrypt(state_get(state, 22), frame); }
+    if (encrypted < 0) { return -1; }
+    let packet: int = transport_packet(state_get(state, 15), encrypted, state_get(state, 24), state_get(state, 25), state_get(state, 12), state_get(state, 26));
+    buffer_free(encrypted); if (packet < 0) { return -1; }
+    let sent: int = net_udp_send(state_get(state, 1), buffer_string(state_get(state, 13)), state_get(state, 14), packet); buffer_free(packet);
+    if (sent < 0) { return -1; }
+    state_put(state, 24, (state_get(state, 24) + 1) % 65536);
+    state_put(state, 25, (state_get(state, 25) + 960) % 4294967296);
+    state_put(state, 26, state_get(state, 26) + 1); return 0;
+}
+
+fn session_audio_tick(state: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 18) != 1) { return -1; }
+    if (state_get(state, 19) != 4 || state_get(state, 29) == 0 || state_get(state, 37) != 0) { return 0; }
+    let now: int = monotonic_now_ms(); if (now < state_get(state, 27)) { return 0; }
+    let silence: int = state_get(state, 31);
+    if (silence > 0) {
+        let frame: int = buffer_new(); if (frame < 0) { return -1; }
+        if (buffer_append(frame, 248) < 0 || buffer_append(frame, 255) < 0 || buffer_append(frame, 254) < 0) { buffer_free(frame); return -1; }
+        let result: int = session_send_frame(state, frame); buffer_free(frame); if (result < 0) { return -1; }
+        state_put(state, 31, silence - 1); state_put(state, 27, now + 20);
+        if (silence == 1 && session_speaking(state, 0) < 0) { return -1; }
+        return 1;
+    }
+    let queue: int = state_get(state, 29); if (state_get(queue, 3) != 0) { return 0; }
+    if (state_get(queue, 2) == 0) { let started: int = queue_next(queue); if (started < 0) { return -1; } if (started == 0) { return 0; } }
+    let pcm: int = state_get(state, 30);
+    if (pcm == 0) { pcm = buffer_new(); if (pcm < 0) { return -1; } state_put(state, 30, pcm); }
+    let data: int = queue_read(queue, 3840 - buffer_len(pcm), 0);
+    if (data > 0) { let rc: int = buffer_append_buffer(pcm, data); buffer_free(data); if (rc < 0) { return -1; } }
+    if (data == -1 || data == -3) { return -1; }
+    if (data == -2) {
+        if (state_get(state, 32) != 0) { state_put(state, 31, 5); }
+        if (buffer_len(pcm) == 0) { return 0; }
+        while (buffer_len(pcm) < 3840) { if (buffer_append(pcm, 0) < 0) { return -1; } }
+        state_put(state, 31, 5);
+    }
+    if (buffer_len(pcm) < 3840) { return 0; }
+    let encoder: int = state_get(state, 28);
+    if (encoder == 0) { encoder = opus_encoder_new(48000, 2); if (encoder < 0) { return -1; } state_put(state, 28, encoder); }
+    let frame: int = opus_encode(encoder, pcm, 960); buffer_free(pcm); state_put(state, 30, 0);
+    if (frame < 0) { return -1; }
+    let result: int = session_send_frame(state, frame); buffer_free(frame); if (result < 0) { return -1; }
+    state_put(state, 27, now + 20); return 1;
+}
+
+fn session_receiver(state: int, user: string): int {
+    if (buffer_len(state) != 344 || state_get(state, 19) != 4 || discord.id_valid(user) == 0) { return -1; }
+    let media: int = 0;
+    if (state_get(state, 39) != 0) { media = dave_decryptor_new(state_get(state, 16), user); } else { media = fr_dave_decryptor_plain_new(); }
+    let decoder: int = opus_decoder_new(48000, 2);
+    let name: int = buffer_from_string(user); let receiver: int = buffer_new();
+    if (media < 0 || decoder < 0 || name < 0 || receiver < 0) {
+        if (media > 0) { dave_media_free(media); } if (decoder > 0) { opus_decoder_free(decoder); }
+        if (name > 0) { buffer_free(name); } if (receiver > 0) { buffer_free(receiver); } return -1;
+    }
+    let i: int = 0; while (i < 48) { if (buffer_append(receiver, 0) < 0) { dave_media_free(media); opus_decoder_free(decoder); buffer_free(name); buffer_free(receiver); return -1; } i = i + 1; }
+    state_put(receiver, 0, media); state_put(receiver, 1, decoder); state_put(receiver, 2, name);
+    if (state_get(state, 39) != 0) { state_put(receiver, 3, state_get(state, 34)); state_put(receiver, 4, 2); } else { state_put(receiver, 4, 1); }
+    if (state_get(state, 39) == 0) { state_put(receiver, 5, 1); } else { state_put(receiver, 5, 2); }
+    return receiver;
+}
+
+fn session_receiver_free(receiver: int): int {
+    if (buffer_len(receiver) != 48) { return -1; }
+    if (state_get(receiver, 0) > 0) { dave_media_free(state_get(receiver, 0)); }
+    opus_decoder_free(state_get(receiver, 1)); buffer_free(state_get(receiver, 2)); return buffer_free(receiver);
+}
+
+fn session_receive_packet(state: int, timeout_ms: int): int {
+    if (buffer_len(state) != 344 || state_get(state, 19) != 4) { return -1; }
+    let udp: int = state_get(state, 1); let packet: int = net_udp_recv(udp, timeout_ms);
+    if (packet <= 0) { return packet; }
+    if (!str_eq(net_udp_host(udp), buffer_string(state_get(state, 13))) || net_udp_port(udp) != state_get(state, 14) || buffer_len(packet) < 12) { buffer_free(packet); return -1; }
+    return packet;
+}
+
+fn packet_ssrc(packet: int): int {
+    if (buffer_len(packet) < 12) { return -1; }
+    return buffer_get(packet, 8) * 16777216 + buffer_get(packet, 9) * 65536 + buffer_get(packet, 10) * 256 + buffer_get(packet, 11);
+}
+
+fn session_decode_packet(state: int, receiver: int, packet: int): int {
+    if (buffer_len(state) != 344 || buffer_len(receiver) != 48 || state_get(state, 19) != 4) { return -1; }
+    let transport: int = transport_decrypt(state_get(state, 15), packet); if (transport < 0) { return -1; }
+    let size: int = buffer_len(transport); let encrypted: int = 0;
+    if (size >= 2 && buffer_get(transport, size - 2) == 250 && buffer_get(transport, size - 1) == 250) { encrypted = 1; }
+    if ((state_get(state, 39) != 0 || encrypted != 0) && state_get(state, 36) == 0 && state_get(receiver, 3) != state_get(state, 34)) {
+        if (fr_dave_decryptor_refresh(state_get(receiver, 0), state_get(state, 16), buffer_string(state_get(receiver, 2))) < 0) { buffer_free(transport); return -1; }
+        state_put(receiver, 3, state_get(state, 34));
+    }
+    let passthrough: int = 0; if (state_get(state, 39) == 0 || state_get(state, 40) == 1) { passthrough = 1; }
+    if (state_get(receiver, 4) != passthrough + 1) {
+        if (fr_dave_decryptor_passthrough(state_get(receiver, 0), passthrough) < 0) { buffer_free(transport); return -1; }
+        state_put(receiver, 4, passthrough + 1);
+    }
+    if (state_get(receiver, 5) == 2 && state_get(state, 39) == 0) {
+        if (fr_dave_decryptor_expire(state_get(receiver, 0)) < 0) { buffer_free(transport); return -1; }
+    }
+    if (state_get(state, 39) == 0) { state_put(receiver, 5, 1); } else { state_put(receiver, 5, 2); }
+    let frame: int = dave_decrypt(state_get(receiver, 0), transport);
+    buffer_free(transport);
+    if (frame < 0) { return -1; }
+    let pcm: int = opus_decode(state_get(receiver, 1), frame, 5760); buffer_free(frame); return pcm;
+}
+
+fn session_last_event(state: int): string {
+    if (buffer_len(state) != 344 || state_get(state, 38) == 0) { return ""; }
+    return buffer_string(state_get(state, 38));
+}

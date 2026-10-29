@@ -1,0 +1,47 @@
+import net;
+import dave;
+import voice;
+import mls_fixture;
+
+native main {
+    let key: int = mls_fixture.private_key(); let sender: int = mls_fixture.sender(key);
+    let creator: int = dave_new(1, "123", "1001"); let joiner: int = dave_new(1, "123", "1002");
+    if (key < 0 || sender < 0 || creator < 0 || joiner < 0 || dave_add_user(creator, "1002") < 0 || dave_add_user(joiner, "1001") < 0 || dave_external_sender(creator, sender) < 0 || dave_external_sender(joiner, sender) < 0) { return 1; }
+    let package: int = dave_key_package(joiner); let proposal: int = mls_fixture.proposal(key, 123, 0, package);
+    let commit: int = dave_proposals(creator, proposal); let end: int = mls_fixture.initial_commit_end(commit);
+    if (package < 0 || proposal < 0 || commit < 0 || end < 0 || end >= buffer_len(commit)) { return 1; }
+    let commit_message: int = buffer_slice(commit, 0, end); let welcome: int = buffer_slice(commit, end, buffer_len(commit) - end);
+    if (dave_welcome(joiner, welcome) != 0) { return 1; }
+    let state: int = buffer_new(); let i: int = 0; while (i < 344) { buffer_append(state, 0); i = i + 1; }
+    voice.state_put(state, 4, buffer_from_string("1001")); voice.state_put(state, 12, 1234); voice.state_put(state, 16, creator);
+    voice.state_put(state, 21, 1); voice.state_put(state, 34, 1); voice.state_put(state, 36, 1);
+    let message: int = buffer_new(); buffer_append(message, 0); buffer_append(message, 1); buffer_append(message, 29);
+    buffer_append(message, 0); buffer_append(message, 0); buffer_append_buffer(message, commit_message);
+    if (voice.session_binary(state, message) != 0 || voice.state_get(state, 19) != 4 || voice.state_get(state, 39) != 1) { println("initial MLS transition failed"); return 1; }
+    let media: int = voice.state_get(state, 22);
+    let repeated: int = voice.session_binary(state, message);
+    if (media <= 0 || repeated != 0 || voice.state_get(state, 22) != media) { println("duplicate MLS commit status", repeated, voice.state_get(state, 22), media); return 1; }
+    let port: int = 0; let sink: int = -1; i = 0;
+    while (sink < 0 && i < 20) { port = 45000 + random_bounded(15000); sink = net_udp_open(port); i = i + 1; }
+    let source: int = net_udp_open(0); let transport_key: int = buffer_new(); i = 0; while (i < 32) { buffer_append(transport_key, i); i = i + 1; }
+    let host: int = buffer_from_string("127.0.0.1"); let audio: int = buffer_new(); buffer_append(audio, 248); buffer_append(audio, 255); buffer_append(audio, 254);
+    if (sink < 0 || source < 0 || transport_key < 0 || host < 0 || audio < 0) { return 1; }
+    voice.state_put(state, 1, source); voice.state_put(state, 13, host); voice.state_put(state, 14, port); voice.state_put(state, 15, transport_key); voice.state_put(state, 32, 1);
+    if (voice.session_send_frame(state, audio) < 0) { println("MLS UDP send failed"); return 1; }
+    let packet: int = net_udp_recv(sink, 1000); let encrypted: int = voice.transport_decrypt(transport_key, packet);
+    let decoder: int = dave_decryptor_new(joiner, "1001"); let plain: int = dave_decrypt(decoder, encrypted);
+    if (packet <= 0 || encrypted <= 0 || decoder <= 0 || plain <= 0 || buffer_len(plain) != 3 || buffer_get(plain, 0) != 248 || buffer_get(plain, 1) != 255 || buffer_get(plain, 2) != 254) { println("MLS UDP receive failed"); return 1; }
+    let joining_state: int = buffer_new(); i = 0; while (i < 344) { buffer_append(joining_state, 0); i = i + 1; }
+    let joiner_key: int = buffer_slice(transport_key, 0, 32);
+    voice.state_put(joining_state, 15, joiner_key); voice.state_put(joining_state, 16, joiner); voice.state_put(joining_state, 19, 4); voice.state_put(joining_state, 34, 2);
+    let receiver: int = voice.session_receiver(joining_state, "1001");
+    let decoded: int = voice.session_decode_packet(joining_state, receiver, packet);
+    if (receiver < 0 || decoded < 0 || buffer_len(decoded) != 3840) { println("prepared upgrade receive failed"); return 1; }
+    buffer_free(decoded); voice.session_receiver_free(receiver); voice.session_close(joining_state);
+    voice.state_put(state, 21, 0);
+    if (voice.session_epoch(state, 1, 2) != 0 || voice.state_get(state, 21) != 1) { println("MLS epoch version failed"); return 1; }
+    buffer_free(plain); dave_media_free(decoder); buffer_free(encrypted); buffer_free(packet); buffer_free(audio); net_udp_close(sink);
+    buffer_free(message); buffer_free(commit_message); buffer_free(welcome); buffer_free(commit); buffer_free(proposal); buffer_free(package); buffer_free(sender); buffer_free(key);
+    if (voice.session_close(state) != 0) { return 1; }
+    println("Voice MLS transition and encrypted local UDP passed"); return 0;
+}

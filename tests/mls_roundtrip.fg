@@ -1,0 +1,50 @@
+import net;
+import dave;
+import mls_fixture;
+
+native main {
+    let lengths: int = buffer_new();
+    if (lengths < 0 || mls_fixture.varint(lengths, 63) < 0 || mls_fixture.varint(lengths, 64) < 0 || mls_fixture.varint(lengths, 16383) < 0 || mls_fixture.varint(lengths, 16384) < 0 || mls_fixture.varint(lengths, 1073741824) != -1) { println("MLS varint encoding failed"); return 1; }
+    if (buffer_len(lengths) != 9 || buffer_get(lengths, 0) != 63 || buffer_get(lengths, 1) != 64 || buffer_get(lengths, 2) != 64 || buffer_get(lengths, 3) != 127 || buffer_get(lengths, 4) != 255 || buffer_get(lengths, 5) != 128 || buffer_get(lengths, 6) != 0 || buffer_get(lengths, 7) != 64 || buffer_get(lengths, 8) != 0) { println("MLS varint boundaries failed"); return 1; }
+    buffer_free(lengths);
+    let key: int = mls_fixture.private_key();
+    let sender: int = mls_fixture.sender(key);
+    let creator: int = dave_new(1, "123", "1001");
+    let joiner: int = dave_new(1, "123", "1002");
+    if (key < 0 || sender < 0 || creator < 0 || joiner < 0) { println("MLS fixture setup failed"); return 1; }
+    if (dave_add_user(creator, "1002") < 0 || dave_add_user(joiner, "1001") < 0 || dave_external_sender(creator, sender) < 0 || dave_external_sender(joiner, sender) < 0) { println("MLS external sender failed"); return 1; }
+    let package: int = dave_key_package(joiner);
+    let proposal: int = mls_fixture.proposal(key, 123, 0, package);
+    if (package < 0 || proposal < 0) { println("MLS proposal creation failed"); return 1; }
+    let bad_creator: int = dave_new(1, "123", "1001");
+    let bad: int = buffer_slice(proposal, 0, buffer_len(proposal));
+    if (bad_creator < 0 || bad < 0 || dave_add_user(bad_creator, "1002") < 0 || dave_external_sender(bad_creator, sender) < 0) { println("MLS negative setup failed"); return 1; }
+    let last: int = buffer_len(bad) - 1;
+    buffer_set(bad, last, (buffer_get(bad, last) + 1) % 256);
+    if (dave_proposals(bad_creator, bad) >= 0) { println("Tampered MLS proposal accepted"); return 1; }
+    buffer_free(bad); dave_free(bad_creator);
+    let commit: int = dave_proposals(creator, proposal);
+    if (commit < 0 || buffer_len(commit) == 0) { println("MLS proposal validation failed"); return 1; }
+    let end: int = mls_fixture.initial_commit_end(commit);
+    if (end < 0 || end >= buffer_len(commit)) { println("MLS commit split failed"); return 1; }
+    let commit_message: int = buffer_slice(commit, 0, end);
+    let welcome: int = buffer_slice(commit, end, buffer_len(commit) - end);
+    if (commit_message < 0 || welcome < 0 || dave_commit(creator, commit_message) != 0 || dave_welcome(joiner, welcome) != 0) { println("MLS commit or welcome failed"); return 1; }
+    let enc: int = dave_encryptor_new(creator, "1001", 1234);
+    let dec: int = dave_decryptor_new(joiner, "1001");
+    let audio: int = buffer_new(); buffer_append(audio, 248); buffer_append(audio, 255); buffer_append(audio, 254);
+    if (enc < 0 || dec < 0) { println("DAVE ratchet creation failed"); return 1; }
+    let ciphertext: int = dave_encrypt(enc, audio);
+    if (ciphertext < 0) { println("DAVE encryption failed"); return 1; }
+    let altered: int = buffer_slice(ciphertext, 0, buffer_len(ciphertext));
+    if (altered < 0) { return 1; }
+    buffer_set(altered, 0, (buffer_get(altered, 0) + 1) % 256);
+    if (dave_decrypt(dec, altered) >= 0) { println("Tampered DAVE frame accepted"); return 1; }
+    buffer_free(altered);
+    let plaintext: int = dave_decrypt(dec, ciphertext);
+    if (plaintext < 0 || buffer_len(plaintext) != 3 || buffer_get(plaintext, 0) != 248 || buffer_get(plaintext, 1) != 255 || buffer_get(plaintext, 2) != 254) { println("DAVE decryption failed"); return 1; }
+    println("Signed MLS Add, commit, welcome and DAVE media roundtrip passed");
+    buffer_free(plaintext); buffer_free(ciphertext); buffer_free(audio); dave_media_free(enc); dave_media_free(dec);
+    buffer_free(welcome); buffer_free(commit_message); buffer_free(commit); buffer_free(proposal); buffer_free(package); buffer_free(sender); buffer_free(key);
+    dave_free(creator); dave_free(joiner); return 0;
+}

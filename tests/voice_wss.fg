@@ -1,0 +1,221 @@
+import net;
+import thread;
+import strings;
+import json;
+import dave;
+import voice;
+import ws_peer;
+import mls_fixture;
+
+extern fn fr_tls_listen(host: string, port: int, cert: string, key: string): int;
+extern fn fr_tls_port(listener: int): int;
+extern fn fr_tls_accept(listener: int, timeout_ms: int): int;
+extern fn fr_tls_close(handle: int): int;
+extern fn fr_net_udp_local_port(handle: int): int;
+
+fn expect_op(connection: int, expected: int): int {
+    let frame: int = ws_peer.read_frame(connection);
+    if (frame < 0 || buffer_get(frame, 0) != 1) { if (frame > 0) { buffer_free(frame); } return -1; }
+    let body: int = buffer_slice(frame, 1, buffer_len(frame) - 1); buffer_free(frame);
+    if (body < 0) { return -1; }
+    let result: int = json_get_path_int(buffer_string(body), "op"); buffer_free(body);
+    if (result != expected) { return -1; } return 0;
+}
+
+fn wait_op(connection: int, expected: int): int {
+    let i: int = 0;
+    while (i < 20) {
+        let frame: int = ws_peer.read_frame(connection);
+        if (frame < 0 || buffer_get(frame, 0) != 1) { if (frame > 0) { buffer_free(frame); } return -1; }
+        let body: int = buffer_slice(frame, 1, buffer_len(frame) - 1); buffer_free(frame);
+        if (body < 0) { return -1; }
+        let op: int = json_get_path_int(buffer_string(body), "op"); buffer_free(body);
+        if (op == expected) { return 0; }
+        if (op != 5) { return -1; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wait_event(state: int, expected: int): int {
+    let i: int = 0;
+    while (i < 500) {
+        if (voice.session_poll(state, 20) < 0) { return -1; }
+        if (json_get_path_int(voice.session_last_event(state), "op") == expected) { return 0; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wait_binary(connection: int, expected: int): int {
+    let i: int = 0;
+    while (i < 20) {
+        let frame: int = ws_peer.read_frame(connection);
+        if (frame < 0) { return -1; }
+        if (buffer_get(frame, 0) == 2 && buffer_get(frame, 1) == expected) { return frame; }
+        if (buffer_get(frame, 0) != 1) { buffer_free(frame); return -1; }
+        let body: int = buffer_slice(frame, 1, buffer_len(frame) - 1); buffer_free(frame);
+        if (body < 0) { return -1; }
+        let op: int = json_get_path_int(buffer_string(body), "op"); buffer_free(body);
+        if (op != 5) { return -1; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn binary_message(seq: int, op: int, transition: int, body: int): int {
+    let message: int = buffer_new(); if (message < 0) { return -1; }
+    if (buffer_append(message, seq / 256) < 0 || buffer_append(message, seq % 256) < 0 || buffer_append(message, op) < 0) { buffer_free(message); return -1; }
+    if (op == 29 || op == 30) { if (buffer_append(message, transition / 256) < 0 || buffer_append(message, transition % 256) < 0) { buffer_free(message); return -1; } }
+    if (buffer_append_buffer(message, body) < 0) { buffer_free(message); return -1; }
+    return message;
+}
+
+fn send_binary(connection: int, seq: int, op: int, transition: int, body: int): int {
+    let frame: int = binary_message(seq, op, transition, body); if (frame < 0) { return -1; }
+    let result: int = ws_peer.send_frame(connection, 2, frame); buffer_free(frame); return result;
+}
+
+fn peer_run(listener: int): int {
+    let connection: int = fr_tls_accept(listener, 10000);
+    if (connection <= 0 || ws_peer.handshake(connection) < 0 || expect_op(connection, 0) < 0) { println("peer identify failed"); return -1; }
+    let udp: int = net_udp_open(0); let udp_port: int = fr_net_udp_local_port(udp);
+    if (udp < 0 || udp_port <= 0) { println("peer UDP bind failed"); return -1; }
+    if (ws_peer.send_text(connection, "{\"op\":8,\"d\":{\"heartbeat_interval\":60000}}") < 0) { return -1; }
+    let ready: string = str_concat(str_concat("{\"op\":2,\"d\":{\"ssrc\":1234,\"ip\":\"127.0.0.1\",\"port\":", str_from_int(udp_port)), ",\"modes\":[\"aead_xchacha20_poly1305_rtpsize\"]}}");
+    if (ws_peer.send_text(connection, ready) < 0) { return -1; }
+    let discovery: int = net_udp_recv(udp, 10000);
+    if (discovery <= 0 || buffer_len(discovery) != 74 || buffer_get(discovery, 1) != 1) { println("peer discovery failed"); return -1; }
+    let client_port: int = net_udp_port(udp); let client_host: int = buffer_from_string(net_udp_host(udp));
+    buffer_set(discovery, 1, 2);
+    let address: string = "127.0.0.1"; let i: int = 0;
+    while (i < str_len(address)) { buffer_set(discovery, 8 + i, str_char_at(address, i)); i = i + 1; }
+    buffer_set(discovery, 72, client_port / 256); buffer_set(discovery, 73, client_port % 256);
+    if (net_udp_send(udp, buffer_string(client_host), client_port, discovery) < 0) { return -1; }
+    buffer_free(discovery);
+    if (expect_op(connection, 1) < 0) { println("peer select protocol failed"); return -1; }
+    let key: int = mls_fixture.private_key(); let sender: int = mls_fixture.sender(key);
+    let joiner: int = dave_new(1, "123", "1002");
+    if (key < 0 || sender < 0 || joiner < 0 || dave_add_user(joiner, "1001") < 0 || dave_external_sender(joiner, sender) < 0) { println("peer MLS setup failed"); return -1; }
+    if (ws_peer.send_text(connection, "{\"op\":11,\"d\":{\"user_ids\":[\"1001\",\"1002\"]}}") < 0 || send_binary(connection, 1, 25, 0, sender) < 0) { return -1; }
+    let description: string = "{\"op\":4,\"d\":{\"mode\":\"aead_xchacha20_poly1305_rtpsize\",\"secret_key\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31],\"dave_protocol_version\":1}}";
+    if (ws_peer.send_text(connection, description) < 0) { return -1; }
+    let package_frame: int = ws_peer.read_frame(connection);
+    if (package_frame < 0 || buffer_get(package_frame, 0) != 2 || buffer_get(package_frame, 1) != 26 || buffer_len(package_frame) < 10) { println("peer client key package failed"); return -1; }
+    buffer_free(package_frame);
+    let package: int = dave_key_package(joiner); let proposal: int = mls_fixture.proposal(key, 123, 0, package);
+    if (package < 0 || proposal < 0 || send_binary(connection, 2, 27, 0, proposal) < 0) { println("peer proposal failed"); return -1; }
+    let commit_frame: int = ws_peer.read_frame(connection);
+    if (commit_frame < 0 || buffer_get(commit_frame, 0) != 2 || buffer_get(commit_frame, 1) != 28) { println("peer commit frame failed"); return -1; }
+    let combined: int = buffer_slice(commit_frame, 2, buffer_len(commit_frame) - 2); buffer_free(commit_frame);
+    let end: int = mls_fixture.initial_commit_end(combined);
+    if (end < 0 || end >= buffer_len(combined)) { println("peer commit split failed"); return -1; }
+    let commit: int = buffer_slice(combined, 0, end); let welcome: int = buffer_slice(combined, end, buffer_len(combined) - end);
+    if (dave_welcome(joiner, welcome) != 0 || send_binary(connection, 3, 29, 0, commit) < 0) { println("peer MLS transition failed"); return -1; }
+    let packet: int = net_udp_recv(udp, 10000);
+    let transport_key: int = buffer_new(); i = 0; while (i < 32) { buffer_append(transport_key, i); i = i + 1; }
+    let encrypted: int = voice.transport_decrypt(transport_key, packet); let decoder: int = dave_decryptor_new(joiner, "1001");
+    let plain: int = dave_decrypt(decoder, encrypted);
+    if (packet <= 0 || encrypted < 0 || decoder < 0 || plain < 0 || buffer_len(plain) != 3 || buffer_get(plain, 0) != 248 || buffer_get(plain, 1) != 255 || buffer_get(plain, 2) != 254) { println("peer inbound audio failed"); return -1; }
+    let encoder: int = dave_encryptor_new(joiner, "1002", 2222); let inbound: int = dave_encrypt(encoder, plain);
+    let outbound: int = voice.transport_packet(transport_key, inbound, 1, 960, 2222, 1);
+    if (encoder < 0 || inbound < 0 || outbound < 0 || net_udp_send(udp, buffer_string(client_host), client_port, outbound) < 0) { println("peer outbound audio failed"); return -1; }
+    let music: int = 0; i = 0;
+    while (music == 0 && i < 30) {
+        let music_packet: int = net_udp_recv(udp, 10000);
+        if (music_packet <= 0) { println("peer music packet timed out"); return -1; }
+        let music_transport: int = voice.transport_decrypt(transport_key, music_packet); buffer_free(music_packet);
+        if (music_transport < 0) { println("peer music transport failed"); return -1; }
+        let music_frame: int = dave_decrypt(decoder, music_transport); buffer_free(music_transport);
+        if (music_frame < 0) { println("peer music decrypt failed"); return -1; }
+        if (buffer_len(music_frame) != 3 || buffer_get(music_frame, 0) != 248 || buffer_get(music_frame, 1) != 255 || buffer_get(music_frame, 2) != 254) { music = 1; }
+        buffer_free(music_frame); i = i + 1;
+    }
+    if (music == 0 || ws_peer.send_text(connection, "{\"op\":42,\"d\":{}}") < 0) { println("peer music not received"); return -1; }
+    if (wait_op(connection, 99) < 0 || ws_peer.send_text(connection, "{\"op\":11,\"d\":{\"user_ids\":[\"1003\"]}}") < 0) { return -1; }
+    let third: int = dave_new(1, "123", "1003");
+    if (third < 0 || dave_add_user(third, "1001") < 0 || dave_add_user(third, "1002") < 0 || dave_external_sender(third, sender) < 0 || dave_add_user(joiner, "1003") < 0) { println("peer epoch setup failed"); return -1; }
+    let third_package: int = dave_key_package(third); let next_proposal: int = mls_fixture.proposal(key, 123, 1, third_package);
+    let unused_commit: int = dave_proposals(joiner, next_proposal);
+    if (third_package < 0 || next_proposal < 0 || unused_commit < 0 || send_binary(connection, 4, 27, 0, next_proposal) < 0) { println("peer epoch proposal failed"); return -1; }
+    buffer_free(unused_commit);
+    let next_frame: int = wait_binary(connection, 28);
+    if (next_frame < 0) { println("peer epoch commit missing"); return -1; }
+    let next_combined: int = buffer_slice(next_frame, 2, buffer_len(next_frame) - 2); buffer_free(next_frame);
+    let next_end: int = mls_fixture.initial_commit_end(next_combined);
+    if (next_end < 0 || next_end >= buffer_len(next_combined)) { println("peer epoch commit split failed"); return -1; }
+    let next_commit: int = buffer_slice(next_combined, 0, next_end); let next_welcome: int = buffer_slice(next_combined, next_end, buffer_len(next_combined) - next_end);
+    if (dave_commit(joiner, next_commit) != 0 || dave_welcome(third, next_welcome) != 0 || send_binary(connection, 5, 29, 9, next_commit) < 0 || wait_op(connection, 23) < 0 || ws_peer.send_text(connection, "{\"op\":43,\"d\":{}}") < 0 || wait_op(connection, 94) < 0 || ws_peer.send_text(connection, "{\"op\":22,\"d\":{\"transition_id\":9}}") < 0 || ws_peer.send_text(connection, "{\"op\":48,\"d\":{}}") < 0 || wait_op(connection, 93) < 0) { println("peer epoch transition failed"); return -1; }
+    buffer_free(next_welcome); buffer_free(next_commit); buffer_free(next_combined); buffer_free(next_proposal); buffer_free(third_package); dave_free(third);
+    if (ws_peer.send_text(connection, "{\"op\":21,\"d\":{\"transition_id\":7,\"protocol_version\":0}}") < 0 || wait_op(connection, 23) < 0 || ws_peer.send_text(connection, "{\"op\":44,\"d\":{}}") < 0 || wait_op(connection, 98) < 0 || ws_peer.send_text(connection, "{\"op\":22,\"d\":{\"transition_id\":7}}") < 0 || ws_peer.send_text(connection, "{\"op\":45,\"d\":{}}") < 0) { println("peer downgrade transition failed"); return -1; }
+    if (wait_op(connection, 97) < 0 || ws_peer.send_text(connection, "{\"op\":21,\"d\":{\"transition_id\":8,\"protocol_version\":1}}") < 0 || wait_op(connection, 23) < 0 || ws_peer.send_text(connection, "{\"op\":46,\"d\":{}}") < 0 || wait_op(connection, 96) < 0 || ws_peer.send_text(connection, "{\"op\":22,\"d\":{\"transition_id\":8}}") < 0 || ws_peer.send_text(connection, "{\"op\":47,\"d\":{}}") < 0) { println("peer upgrade transition failed"); return -1; }
+    let updated_encoder: int = dave_encryptor_new(joiner, "1002", 2222);
+    let updated_frame: int = dave_encrypt(updated_encoder, plain);
+    let updated_packet: int = voice.transport_packet(transport_key, updated_frame, 2, 1920, 2222, 2);
+    if (updated_encoder < 0 || updated_frame < 0 || updated_packet < 0 || net_udp_send(udp, buffer_string(client_host), client_port, updated_packet) < 0 || wait_op(connection, 95) < 0) { println("peer updated epoch media failed"); return -1; }
+    buffer_free(updated_packet); buffer_free(updated_frame); dave_media_free(updated_encoder);
+    let close_body: int = buffer_new(); buffer_append(close_body, 3); buffer_append(close_body, 233);
+    if (ws_peer.send_frame(connection, 8, close_body) < 0) { return -1; }
+    buffer_free(close_body); fr_tls_close(connection);
+    let resumed: int = fr_tls_accept(listener, 10000);
+    if (resumed <= 0 || ws_peer.handshake(resumed) < 0 || expect_op(resumed, 7) < 0 || ws_peer.send_text(resumed, "{\"op\":8,\"d\":{\"heartbeat_interval\":60000}}") < 0 || ws_peer.send_text(resumed, "{\"op\":9,\"d\":{}}") < 0) { println("peer resume failed"); return -1; }
+    fr_tls_close(resumed); net_udp_close(udp); dave_media_free(encoder); dave_media_free(decoder); dave_free(joiner);
+    buffer_free(outbound); buffer_free(inbound); buffer_free(plain); buffer_free(encrypted); buffer_free(packet); buffer_free(transport_key); buffer_free(client_host);
+    buffer_free(welcome); buffer_free(commit); buffer_free(combined); buffer_free(proposal); buffer_free(package); buffer_free(sender); buffer_free(key);
+    return 0;
+}
+
+fn peer(args: int): int {
+    let result: int = peer_run(voice.state_get(args, 0));
+    if (result == 0) { voice.state_put(args, 1, 1); } else { voice.state_put(args, 1, 2); }
+    return result;
+}
+
+native main {
+    let listener: int = fr_tls_listen("127.0.0.1", 0, "build/fixture-cert.pem", "build/fixture-key.pem");
+    if (listener < 0) { println("voice fixture listener failed"); return 1; }
+    let args: int = buffer_new(); let i: int = 0; while (i < 16) { buffer_append(args, 0); i = i + 1; }
+    voice.state_put(args, 0, listener); let thread: int = thread_spawn(peer, args);
+    let endpoint: string = str_concat("localhost:", str_from_int(fr_tls_port(listener)));
+    let state: int = voice.session_open(endpoint, "1", "123", "1001", "session", "fixture-token");
+    if (thread < 0 || state < 0) { println("voice client open failed"); return 1; }
+    i = 0;
+    while (voice.state_get(state, 19) != 4 && i < 500) { if (voice.session_poll(state, 50) < 0) { println("voice handshake poll failed"); return 1; } i = i + 1; }
+    if (voice.state_get(state, 19) != 4) { println("voice media not ready"); return 1; }
+    let audio: int = buffer_new(); buffer_append(audio, 248); buffer_append(audio, 255); buffer_append(audio, 254);
+    if (voice.session_send_frame(state, audio) < 0) { println("voice client send failed"); return 1; }
+    let incoming: int = voice.session_receive_packet(state, 10000);
+    let receiver: int = voice.session_receiver(state, "1002");
+    let decoded: int = voice.session_decode_packet(state, receiver, incoming);
+    if (incoming <= 0 || voice.packet_ssrc(incoming) != 2222 || receiver < 0 || decoded < 0 || buffer_len(decoded) != 3840) { println("voice client receive failed"); return 1; }
+    if (voice.session_enqueue(state, "build/fixture.wav") < 0 || voice.session_enqueue(state, "build/fixture.wav") < 0 || voice.session_pause(state) < 0) { println("voice queue setup failed"); return 1; }
+    let queue: int = voice.state_get(state, 29);
+    i = 0;
+    while (i < 8) { if (voice.session_poll(state, 20) < 0) { println("voice paused poll failed"); return 1; } i = i + 1; }
+    if (voice.state_get(queue, 2) != 0 || voice.session_resume(state) < 0) { println("voice pause failed"); return 1; }
+    let heard: int = 0; i = 0;
+    while (heard == 0 && i < 500) {
+        if (voice.session_poll(state, 20) < 0) { println("voice music poll failed"); return 1; }
+        if (json_get_path_int(voice.session_last_event(state), "op") == 42) { heard = 1; }
+        i = i + 1;
+    }
+    if (heard == 0 || voice.state_get(queue, 2) == 0 || voice.state_get(queue, 0) == 0 || voice.session_skip(state) < 0 || voice.state_get(queue, 2) != 0 || voice.session_stop(state) < 0 || voice.state_get(queue, 0) != 0) { println("voice playback or queue controls failed"); return 1; }
+    let old_generation: int = voice.state_get(state, 35);
+    if (voice.session_send_text(state, "{\"op\":99,\"d\":{}}") < 0) { return 1; }
+    if (wait_event(state, 43) < 0 || voice.state_get(state, 39) != 1 || voice.state_get(state, 34) <= old_generation || voice.state_get(state, 35) != old_generation || voice.session_send_text(state, "{\"op\":94,\"d\":{}}") < 0) { println("voice epoch preparation failed"); return 1; }
+    if (wait_event(state, 48) < 0 || voice.state_get(state, 39) != 1 || voice.state_get(state, 35) != voice.state_get(state, 34) || voice.session_send_text(state, "{\"op\":93,\"d\":{}}") < 0) { println("voice epoch execution failed"); return 1; }
+    if (wait_event(state, 44) < 0 || voice.state_get(state, 39) != 1 || voice.session_send_text(state, "{\"op\":98,\"d\":{}}") < 0) { println("voice downgrade preparation failed"); return 1; }
+    if (wait_event(state, 45) < 0 || voice.state_get(state, 39) != 0 || voice.session_send_text(state, "{\"op\":97,\"d\":{}}") < 0) { println("voice downgrade execution failed"); return 1; }
+    if (wait_event(state, 46) < 0 || voice.state_get(state, 39) != 0 || voice.session_send_text(state, "{\"op\":96,\"d\":{}}") < 0) { println("voice upgrade preparation failed"); return 1; }
+    if (wait_event(state, 47) < 0 || voice.state_get(state, 39) != 1) { println("voice upgrade execution failed"); return 1; }
+    let updated_packet: int = voice.session_receive_packet(state, 10000);
+    let updated_audio: int = voice.session_decode_packet(state, receiver, updated_packet);
+    if (updated_packet <= 0 || updated_audio < 0 || buffer_len(updated_audio) != 3840 || voice.session_send_text(state, "{\"op\":95,\"d\":{}}") < 0) { println("voice updated epoch media failed"); return 1; }
+    buffer_free(updated_audio); buffer_free(updated_packet);
+    i = 0;
+    while (voice.state_get(state, 37) == 0 && i < 100) { if (voice.session_poll(state, 50) < 0) { println("voice reconnect failed"); return 1; } i = i + 1; }
+    while (voice.state_get(state, 37) != 0 && i < 200) { if (voice.session_poll(state, 50) < 0) { println("voice resume failed"); return 1; } i = i + 1; }
+    if (thread_join(thread) < 0 || voice.state_get(args, 1) != 1) { println("voice peer failed"); return 1; }
+    buffer_free(decoded); voice.session_receiver_free(receiver); buffer_free(incoming); buffer_free(audio); voice.session_close(state); fr_tls_close(listener); buffer_free(args);
+    println("Local WSS voice discovery, MLS, UDP media and resume passed"); return 0;
+}

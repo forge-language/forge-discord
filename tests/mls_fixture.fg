@@ -1,0 +1,101 @@
+import net;
+
+extern fn fr_p256_public(private_key: int): int;
+extern fn fr_p256_sign(private_key: int, message: int): int;
+extern fn fr_p256_verify(public_key: int, message: int, signature: int): int;
+
+// RFC 9420 sections 2 and 6; libdave cpp/test/external_sender.cpp uses suite 2 and sender index 0.
+fn varint(out: int, value: int): int {
+    if (value < 0 || value > 1073741823) { return -1; }
+    if (value < 64) { return buffer_append(out, value); }
+    if (value < 16384) {
+        if (buffer_append(out, 64 + value / 256) < 0) { return -1; }
+        return buffer_append(out, value % 256);
+    }
+    if (buffer_append(out, 128 + value / 16777216) < 0 || buffer_append(out, (value / 65536) % 256) < 0 || buffer_append(out, (value / 256) % 256) < 0) { return -1; }
+    return buffer_append(out, value % 256);
+}
+
+fn vector(out: int, data: int): int {
+    let n: int = buffer_len(data);
+    if (varint(out, n) < 0) { return -1; }
+    return buffer_append_buffer(out, data);
+}
+
+fn u64(out: int, value: int): int {
+    if (value < 0) { return -1; }
+    let divisor: int = 72057594037927936;
+    while (divisor > 0) {
+        if (buffer_append(out, (value / divisor) % 256) < 0) { return -1; }
+        divisor = divisor / 256;
+    }
+    return 0;
+}
+
+// Fixed scalar is for this offline test fixture only.
+fn private_key(): int {
+    let key: int = buffer_new(); if (key < 0) { return -1; }
+    let i: int = 0;
+    while (i < 31) { if (buffer_append(key, 0) < 0) { buffer_free(key); return -1; } i = i + 1; }
+    if (buffer_append(key, 1) < 0) { buffer_free(key); return -1; }
+    return key;
+}
+
+fn sender(key: int): int {
+    let pub: int = fr_p256_public(key); if (pub < 0) { return -1; }
+    let out: int = buffer_new();
+    if (out < 0) { buffer_free(pub); return -1; }
+    let ok: int = vector(out, pub); buffer_free(pub);
+    if (ok < 0 || buffer_append(out, 0) < 0 || buffer_append(out, 1) < 0 || buffer_append(out, 4) < 0 || buffer_append(out, 0) < 0 || buffer_append(out, 1) < 0 || buffer_append(out, 1) < 0 || buffer_append(out, 0) < 0) { buffer_free(out); return -1; }
+    return out;
+}
+
+fn proposal(key: int, group: int, epoch: int, key_package: int): int {
+    let framed: int = buffer_new(); if (framed < 0) { return -1; }
+    if (buffer_append(framed, 0) < 0 || buffer_append(framed, 1) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 1) < 0 || buffer_append(framed, 8) < 0 || u64(framed, group) < 0 || u64(framed, epoch) < 0 || buffer_append(framed, 2) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 2) < 0 || buffer_append(framed, 0) < 0 || buffer_append(framed, 1) < 0 || buffer_append_buffer(framed, key_package) < 0) { buffer_free(framed); return -1; }
+    let label: int = buffer_from_string("MLS 1.0 FramedContentTBS");
+    let signable: int = buffer_new();
+    if (label < 0 || signable < 0) { if (label > 0) { buffer_free(label); } if (signable > 0) { buffer_free(signable); } buffer_free(framed); return -1; }
+    let ok: int = vector(signable, label); buffer_free(label);
+    if (ok < 0 || vector(signable, framed) < 0) { buffer_free(signable); buffer_free(framed); return -1; }
+    let signature: int = fr_p256_sign(key, signable); buffer_free(signable);
+    if (signature < 0) { buffer_free(framed); return -1; }
+    ok = vector(framed, signature); buffer_free(signature);
+    if (ok < 0) { buffer_free(framed); return -1; }
+    let out: int = buffer_new();
+    if (out < 0) { buffer_free(framed); return -1; }
+    if (buffer_append(out, 0) < 0 || vector(out, framed) < 0) { buffer_free(framed); buffer_free(out); return -1; }
+    buffer_free(framed); return out;
+}
+
+fn skip_vector(data: int, offset: int): int {
+    let first: int = buffer_get(data, offset);
+    if (first < 0 || first >= 192) { return -1; }
+    let size: int = 1;
+    if (first >= 128) { size = 4; } else if (first >= 64) { size = 2; }
+    let n: int = first % 64; let i: int = 1;
+    while (i < size) {
+        let c: int = buffer_get(data, offset + i);
+        if (c < 0) { return -1; }
+        n = n * 256 + c; i = i + 1;
+    }
+    if ((size == 2 && n < 64) || (size == 4 && n < 16384)) { return -1; }
+    if (offset + size + n > buffer_len(data)) { return -1; }
+    return offset + size + n;
+}
+
+// The upstream initial Add-only commit does not force an update path.
+fn initial_commit_end(data: int): int {
+    if (buffer_get(data, 0) != 0 || buffer_get(data, 1) != 1 || buffer_get(data, 2) != 0 || buffer_get(data, 3) != 1) { return -1; }
+    let pos: int = skip_vector(data, 4);
+    if (pos < 0 || buffer_get(data, pos + 8) != 1) { return -1; }
+    pos = skip_vector(data, pos + 13);
+    if (pos < 0 || buffer_get(data, pos) != 3) { return -1; }
+    pos = skip_vector(data, pos + 1);
+    if (pos < 0 || buffer_get(data, pos) != 0) { return -1; }
+    pos = skip_vector(data, pos + 1);
+    if (pos < 0) { return -1; }
+    pos = skip_vector(data, pos);
+    if (pos < 0) { return -1; }
+    return skip_vector(data, pos);
+}
